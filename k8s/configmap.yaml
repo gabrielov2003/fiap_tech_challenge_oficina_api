@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oficina-config
+data:
+  FLASK_DEBUG: "0"
+  DATABASE_PATH: "/app/instance/database.db"

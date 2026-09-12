@@ -1,0 +1,7 @@
+Flask==2.3.2
+Flask-JWT-Extended==4.6.0
+werkzeug==2.3.7
+pandas
+flasgger
+bandit
+pytest
