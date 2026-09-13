@@ -1,138 +1,105 @@
 # fiap_tech_challenge_oficina_api
 
-Aplicação principal do sistema de gestão de uma oficina mecânica, responsável pelas regras de negócio (clientes, veículos, peças, serviços e ordens de serviço). Este é um dos 4 repositórios do Tech Challenge Fase 3:
+API da oficina mecânica: clientes, veículos, catálogo de peças e serviços e ordens de serviço. Roda no EKS, atrás do API Gateway, e grava no RDS PostgreSQL. Faz parte do Tech Challenge Fase 3:
 
 | Repositório | Responsabilidade |
 |---|---|
-| `fiap_tech_challenge_oficina_api` | Este repositório. Aplicação principal, executando em Kubernetes |
-| `fiap_tech_challenge_oficina_auth_lambda` | Function serverless de autenticação via CPF e API Gateway |
-| `fiap_tech_challenge_oficina_infra_k8s` | Terraform da rede, do cluster Kubernetes, do registro de imagens e do monitoramento |
-| `fiap_tech_challenge_oficina_infra_database` | Terraform do banco de dados gerenciado |
-
-## Tecnologias utilizadas
-
-* Python 3.11 e Flask, API RESTful
-* Gunicorn, servidor de aplicação em produção
-* Flask-JWT-Extended, validação dos tokens JWT de funcionários e de clientes
-* PostgreSQL gerenciado (AWS RDS), acessado com psycopg2 e pool de conexões
-* Docker e Docker Compose
-* Kubernetes (AWS EKS) com HorizontalPodAutoscaler
-* Datadog: APM com ddtrace, métricas customizadas via DogStatsD, logs em JSON e healthcheck
-* GitHub Actions, CI/CD com deploy automático por ambiente
-* Flasgger (Swagger)
-* Pytest e Bandit
+| fiap_tech_challenge_oficina_api | Este repositório. Aplicação principal, no EKS |
+| [fiap_tech_challenge_oficina_auth_lambda](https://github.com/gabrielov2003/fiap_tech_challenge_oficina_auth_lambda) | Autenticação por CPF e API Gateway |
+| [fiap_tech_challenge_oficina_infra_k8s](https://github.com/gabrielov2003/fiap_tech_challenge_oficina_infra_k8s) | Rede, cluster EKS, segredos e Datadog |
+| [fiap_tech_challenge_oficina_infra_database](https://github.com/gabrielov2003/fiap_tech_challenge_oficina_infra_database) | Banco de dados RDS PostgreSQL |
 
 ## Arquitetura
 
-O projeto segue Domain Driven Design com arquitetura hexagonal (ports and adapters):
+```mermaid
+flowchart LR
+    U["Cliente ou atendente"] -->|"HTTPS com JWT"| GW["API Gateway"]
+    GW -->|"HTTP proxy com X-Correlation-ID"| LB["Load Balancer"]
+    subgraph EKS["EKS, namespace dev ou prod"]
+        API["Pods oficina-api, HPA de 1 a 5"]
+        DD["Datadog Agent"]
+    end
+    LB --> API
+    API -->|"SQL no schema do ambiente"| RDS[("RDS PostgreSQL")]
+    API -.->|"métricas, traces e logs"| DD
+    SSM["SSM Parameter Store"] -.->|"segredos no deploy"| API
+```
 
-* `src/domain.py`: entidades de negócio, validações de CPF/CNPJ e placa, status do cliente e as transições permitidas da OS (`TRANSICOES`)
-* `src/ports.py`: interfaces que a aplicação enxerga: repositórios, verificação de saúde do banco e métricas
-* `src/infrastructure.py`: adapters concretos, repositórios PostgreSQL e métricas Datadog
-* `src/application.py`: casos de uso, orquestrando domínio, repositórios e métricas através das interfaces
-* `src/web.py`: endpoints, controle de acesso por perfil e documentação Swagger
-* `src/observabilidade.py`: logs estruturados em JSON e correlação de requisições
-* `src/app.py`: ponto de entrada, injeta os adapters concretos na aplicação
+O código segue DDD com arquitetura hexagonal:
 
-## Integração com os outros repositórios
+| Arquivo | Papel |
+|---|---|
+| `src/domain.py` | Entidades, validação de CPF, CNPJ e placa, e transições da OS |
+| `src/ports.py` | Interfaces de repositórios, saúde do banco e métricas |
+| `src/application.py` | Casos de uso |
+| `src/infrastructure.py` | Repositórios PostgreSQL e métricas do Datadog |
+| `src/web.py` | Rotas, controle de acesso por perfil e Swagger |
+| `src/observabilidade.py` | Logs JSON e correlation id |
+| `src/app.py` | Monta a aplicação e injeta os adapters |
 
-Os repositórios se comunicam pelo AWS SSM Parameter Store, sem nenhum segredo versionado:
-
-| Parâmetro | Quem cria | Uso nesta API |
-|---|---|---|
-| `/oficina/eks/cluster_name` | infra_k8s | Pipeline configura o kubectl |
-| `/oficina/db/host`, `port`, `name`, `username`, `password` | infra_database | Conexão com o RDS |
-| `/oficina/<env>/jwt_secret` | infra_k8s | Validação dos tokens, o mesmo segredo que a Lambda usa para assinar |
-| `/oficina/<env>/webhook_token` | infra_k8s | Autenticação do webhook |
-| `/oficina/<env>/admin_password` | infra_k8s | Senha inicial do usuário admin |
-| `/oficina/<env>/api_url` | pipeline desta API | Endereço do LoadBalancer, usado pelo API Gateway para rotear as requisições |
-
-Fluxo de uma requisição de cliente: o cliente chama `POST /auth` no API Gateway com o CPF, a Lambda valida o CPF, confere se o cliente existe e está ativo e devolve um JWT. Com esse token o cliente chama as rotas da API pelo mesmo API Gateway, que repassa a requisição ao LoadBalancer da API incluindo o header `X-Correlation-ID`.
-
-## Perfis de acesso
+## Autenticação e perfis
 
 | Perfil | Como obtém o token | O que acessa |
 |---|---|---|
-| `admin` (funcionário) | `POST /api/login` com usuário e senha | Todas as rotas protegidas |
-| `cliente` | `POST /auth` no API Gateway, com o CPF | Abrir OS para si, listar as próprias OS e aprovar ou recusar o orçamento das próprias OS |
+| `admin` (funcionário) | `POST /api/login` com usuário e senha | Todas as rotas |
+| `cliente` | `POST /auth` no API Gateway, com o CPF | Abrir OS para si, listar as próprias OS e aprovar ou recusar o orçamento delas |
 
-Rotas públicas: `GET /api/os/{id}`, `GET /api/os/{id}/status`, `POST /api/os/webhook/status` (autenticada pelo token do webhook), `GET /api/health` e `GET /api/ready`.
+Rotas públicas: `GET /api/os/{id}`, `GET /api/os/{id}/status`, `POST /api/os/webhook/status` (com o token do webhook), `GET /api/health` e `GET /api/ready`.
 
-## Fluxo da Ordem de Serviço
+Na nuvem, a senha do `admin` de cada ambiente fica no SSM, em `/oficina/<env>/admin_password`.
 
-Recebida, Em diagnóstico, Aguardando aprovação, e então Aprovado, Recusada ou Solicitado alterações (que volta para Em diagnóstico). Aprovado segue para Em execução ou Aguardando peças, e depois Finalizada e Entregue. Qualquer transição fora dessa ordem é rejeitada, e cada mudança de status fica registrada na tabela `historico_status_os`, o que permite medir o tempo gasto em cada etapa.
+## Swagger
+
+* Nuvem: `<URL do gateway>/apidocs/`, com a barra no final. A URL do gateway está em `/oficina/<env>/gateway_url` no SSM.
+* Local: `http://localhost:5000/apidocs/`.
+
+Gere o token (`POST /api/login` para funcionários ou `POST /auth` no gateway para clientes), clique em Authorize e informe `Bearer <token>`.
+
+## Fluxo da ordem de serviço
+
+Recebida, Em diagnóstico, Aguardando aprovação e então Aprovado, Recusada ou Solicitado alterações, que volta para Em diagnóstico. Aprovado segue para Em execução ou Aguardando peças, e depois Finalizada e Entregue. Transições fora dessa ordem são rejeitadas. A troca de status só grava se o status lido ainda for o atual, e cada mudança entra em `historico_status_os`, base do tempo médio por status em `GET /api/os/tempo-medio`.
 
 ## Banco de dados
 
-Principais ajustes no modelo relacional em relação à fase anterior:
-
-* Migração de SQLite para PostgreSQL gerenciado
-* Chaves estrangeiras reais entre ordem de serviço, cliente, veículo e itens, com exclusão em cascata dos itens e do histórico da OS
-* Chave primária nas tabelas de peças e serviços da OS
-* Restrições de consistência: valores e estoque não negativos, documento e placa únicos, status do cliente limitado a `ativo` e `inativo`
-* Índices em status, cliente e veículo da OS, e nas chaves das tabelas filhas
-* Tabela `historico_status_os`, base do tempo médio por status
-* Coluna `status` no cliente, consultada pela Lambda na autenticação
-* Mudança de status atômica com controle de concorrência: a atualização só acontece se o status atual ainda for o esperado
-
-As tabelas são criadas pela própria aplicação na inicialização, dentro de um lock no banco, então várias réplicas podem subir ao mesmo tempo sem conflito. Cada ambiente usa o próprio schema (`dev` ou `prod`) no mesmo RDS.
+As tabelas são criadas pela API na inicialização, dentro de um advisory lock, então várias réplicas sobem juntas sem conflito. Cada ambiente usa o próprio schema (`dev` ou `prod`) no mesmo RDS. A justificativa do banco, o diagrama ER e os relacionamentos estão no [README do infra_database](https://github.com/gabrielov2003/fiap_tech_challenge_oficina_infra_database).
 
 ## Observabilidade
 
-* Logs em JSON no stdout, com `correlation_id` (o header `X-Correlation-ID` recebido do API Gateway ou um id gerado), `dd.trace_id` para ligar o log ao trace no Datadog, e método, rota, status e duração de cada requisição
-* APM com ddtrace, que mede a latência por endpoint
-* Métricas customizadas enviadas ao agente do Datadog:
+* Logs JSON no stdout com `correlation_id`, `dd.trace_id`, rota, status e duração de cada requisição.
+* APM com `ddtrace-run`, que mede a latência por endpoint.
+* Healthcheck em `/api/health` (liveness) e `/api/ready` (readiness, testa o banco), usados pelas probes e pelo `http_check` do Datadog.
+* Métricas de negócio pelo DogStatsD:
 
-| Métrica | Descrição |
+| Métrica | O que mede |
 |---|---|
-| `oficina.os.abertas` | Ordens de serviço abertas, base do volume diário |
-| `oficina.os.tempo_status` | Tempo em segundos que a OS ficou em cada status, com a tag `status` |
+| `oficina.os.abertas` | OS abertas, base do volume diário |
 | `oficina.os.status_alterado` | Mudanças de status |
-| `oficina.os.falhas` | Falhas inesperadas no processamento de OS, com a tag `operacao` |
+| `oficina.os.tempo_status` | Segundos em cada status, com a tag `status` |
+| `oficina.os.falhas` | Falhas no processamento de OS, com a tag `operacao` |
 | `oficina.integracao.erros` | Erros no webhook, com as tags `integracao` e `motivo` |
 
-* Healthcheck: `/api/health` (liveness) e `/api/ready` (readiness, verifica o banco), usados pelas probes do Kubernetes e pelo `http_check` do agente do Datadog
-
-O dashboard e os alertas são criados pelo repositório `fiap_tech_challenge_oficina_infra_k8s`.
+O dashboard e os alertas são criados pelo `infra_k8s`.
 
 ## Como rodar localmente
 
-Pré-requisitos: Git, Docker e Docker Compose, e Python 3.11+ para rodar os testes fora do Docker.
+Pré-requisitos: Docker e, para os testes, Python 3.11+. O `.env.example` traz todas as variáveis.
 
-1. Clone o repositório.
-2. Configure as variáveis de ambiente:
-   ```bash
-   cp .env.example .env
-   ```
-   | Variável | Descrição | Padrão |
-   |---|---|---|
-   | `FLASK_DEBUG` | Ativa o modo debug do Flask (`0` desligado) | `0` |
-   | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | Conexão com o PostgreSQL | banco do Docker Compose |
-   | `DB_SCHEMA` | Schema onde as tabelas são criadas | `public` |
-   | `JWT_SECRET_KEY` | Chave de assinatura dos tokens JWT | |
-   | `WEBHOOK_TOKEN` | Token de autenticação do webhook | |
-   | `ADMIN_PASSWORD` | Senha do usuário admin criado na primeira inicialização | `admin123` |
-   | `DD_API_KEY`, `DD_SITE` | Chave e site do Datadog, usados apenas pelo agente local | `datadoghq.com` |
-3. Suba o banco e a API:
-   ```bash
-   docker compose up --build
-   ```
-4. A API fica em `http://localhost:5000` e o Swagger em `http://localhost:5000/apidocs/`.
-5. Faça login com `POST /api/login`, body `{"username": "admin", "senha": "admin123"}`, e use o token no header `Authorization: Bearer <token>` (no Swagger, pelo botão Authorize).
+```bash
+cp .env.example .env
+docker compose up --build
+```
 
-### Monitoramento local com Datadog
+A API sobe em `http://localhost:5000`. Login: `POST /api/login` com `{"username": "admin", "senha": "admin123"}`.
 
-O arquivo `docker-compose.datadog.yml` sobe o agente do Datadog junto com a API, com APM, coleta dos logs dos containers, métricas customizadas e o healthcheck. Preencha `DD_API_KEY` e `DD_SITE` no `.env` e rode:
+Para mandar os dados ao Datadog, preencha `DD_API_KEY` e `DD_SITE` no `.env` e suba junto o agente. Os dados chegam com a tag `env:local`:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.datadog.yml up -d --build
 ```
 
-Os dados chegam no Datadog com a tag `env:local`.
+## Testes
 
-## Testes automatizados
-
-Os testes rodam contra um PostgreSQL real. Com o banco do Docker Compose no ar:
+Rodam contra um PostgreSQL real:
 
 ```bash
 docker compose up -d db
@@ -140,43 +107,41 @@ python -m pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest tests/unit_tests.py -v
 ```
 
-Cobrem CRUD de clientes, veículos, peças e serviços, o fluxo completo da OS (aprovação, recusa e solicitação de alterações), permissões por perfil (cliente só acessa as próprias OS e não acessa rotas administrativas), tokens no mesmo formato gerado pela Lambda, histórico e tempo médio por status, restrições do banco (documento e placa duplicados, cliente inexistente, exclusão bloqueada por vínculo), webhook, healthchecks e propagação do correlation id.
+Cobrem os cadastros, o fluxo completo da OS, as permissões por perfil, o token no formato da Lambda, o histórico e o tempo médio, as restrições do banco, o webhook, os healthchecks e o correlation id.
 
 ## Kubernetes
 
-Os manifestos ficam em `k8s/` e são parametrizados por ambiente pelo pipeline, via `envsubst`:
+Os manifestos em `k8s/` são preenchidos pelo pipeline com `envsubst`:
 
-| Arquivo | Recurso | Descrição |
+| Arquivo | O que cria |
+|---|---|
+| `namespace.yaml` | Namespace do ambiente |
+| `configmap.yaml` | Conexão com o banco, sem a senha, e schema |
+| `secret.yaml` | Senha do banco, chave JWT, token do webhook e senha do admin, lidos do SSM |
+| `deployment.yaml` | Pods com probes, limites de CPU e memória, tags do Datadog e `http_check` |
+| `service.yaml` | LoadBalancer usado pelo API Gateway |
+| `hpa.yaml` | Escala de 1 a 5 pods por CPU (70%) ou memória (80%) |
+
+## CI/CD
+
+| Branch | Ambiente | Namespace e schema |
 |---|---|---|
-| `namespace.yaml` | Namespace | Um namespace por ambiente (`dev` e `prod`) |
-| `configmap.yaml` | ConfigMap | Conexão com o banco (sem a senha) e schema do ambiente |
-| `secret.yaml` | Secret | Senha do banco, segredo JWT, token do webhook e senha do admin, lidos do SSM |
-| `deployment.yaml` | Deployment | Pods da API com probes, limites de CPU e memória, tags do Datadog e healthcheck do agente |
-| `service.yaml` | Service (LoadBalancer) | Expõe a API para o API Gateway |
-| `hpa.yaml` | HorizontalPodAutoscaler | Escala de 1 a 5 pods por CPU (70%) ou memória (80%) |
-
-## CI/CD e ambientes
-
-| Branch | Ambiente | Namespace | Schema no banco |
-|---|---|---|---|
-| `dev` | dev | `dev` | `dev` |
-| `main` | prod | `prod` | `prod` |
-
-O pipeline em `.github/workflows/ci-cd.yml`:
+| `dev` | dev | `dev` |
+| `main` | prod | `prod` |
 
 | Job | Quando roda | O que faz |
 |---|---|---|
-| `test` | Pull requests para `main` ou `dev`, e pushes | Sobe um PostgreSQL de serviço, roda os testes e o Bandit |
-| `build` | Push em `dev` ou `main` | Builda a imagem e envia para o ECR `oficina-api` |
-| `deploy` | Depois do build | Lê os parâmetros do SSM, aplica os manifestos no namespace do ambiente, espera o rollout e publica a URL do LoadBalancer |
+| `test` | Pull requests e pushes em `dev` e `main` | Testes com um PostgreSQL de serviço e Bandit |
+| `build` | Push em `dev` ou `main` | Build da imagem e push no ECR `oficina-api` |
+| `deploy` | Depois do build | Lê o SSM, aplica os manifestos, espera o rollout e publica a URL do LoadBalancer em `/oficina/<env>/api_url`, usada pelo API Gateway |
 
-Secrets necessários (Settings, Secrets and variables, Actions): `AWS_ACCESS_KEY_ID` e `AWS_SECRET_ACCESS_KEY`. Variável opcional: `AWS_REGION` (padrão `us-east-1`). Sem as credenciais, o pipeline roda os testes e ignora build e deploy.
+Secrets: `AWS_ACCESS_KEY_ID` e `AWS_SECRET_ACCESS_KEY`. Variável opcional: `AWS_REGION` (padrão `us-east-1`). Sem as credenciais, só os testes rodam.
 
-Ordem do primeiro deploy: `infra_k8s`, `infra_database`, esta API, e por último a `auth_lambda`, que usa a URL publicada aqui para rotear as requisições.
+Ordem do primeiro deploy: `infra_k8s`, `infra_database`, esta API e por último a `auth_lambda`.
 
 ## Documentação
 
-A documentação arquitetural completa (diagramas de componentes e de sequência, RFCs, ADRs, diagrama ER e justificativa do banco de dados) será adicionada aqui.
+RFCs, ADRs, diagramas e roteiro do vídeo: [documentacao_fase3](https://github.com/gabrielov2003/TechChallenge1/tree/main/documentacao_fase3).
 
 ---
 Este projeto faz parte do Tech Challenge da Pós Graduação em Arquitetura de Software da FIAP.
