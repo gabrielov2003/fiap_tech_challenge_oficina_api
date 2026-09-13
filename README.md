@@ -46,7 +46,7 @@ O código segue DDD com arquitetura hexagonal:
 
 Rotas públicas: `GET /api/os/{id}`, `GET /api/os/{id}/status`, `POST /api/os/webhook/status` (com o token do webhook), `GET /api/health` e `GET /api/ready`.
 
-Na nuvem, a senha do `admin` de cada ambiente fica no SSM, em `/oficina/<env>/admin_password`.
+Na nuvem, a senha do `admin` vem do secret `ADMIN_PASSWORD` do GitHub. Sem ele, o pipeline usa a senha gerada pelo Terraform em `/oficina/<env>/admin_password`, no SSM. Para trocar, altere o secret e rode o deploy de novo: a API atualiza a senha ao subir.
 
 ## Swagger
 
@@ -135,7 +135,7 @@ Os manifestos em `k8s/` são preenchidos pelo pipeline com `envsubst`:
 | `build` | Push em `dev` ou `main` | Build da imagem e push no ECR `oficina-api` |
 | `deploy` | Depois do build | Lê o SSM, aplica os manifestos, espera o rollout e publica a URL do LoadBalancer em `/oficina/<env>/api_url`, usada pelo API Gateway |
 
-Secrets: `AWS_ACCESS_KEY_ID` e `AWS_SECRET_ACCESS_KEY`. Variável opcional: `AWS_REGION` (padrão `us-east-1`). Sem as credenciais, só os testes rodam.
+Secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` e, opcional, `ADMIN_PASSWORD` (use letras e números). Variável opcional: `AWS_REGION` (padrão `us-east-1`). Sem as credenciais, só os testes rodam.
 
 Ordem do primeiro deploy: `infra_k8s`, `infra_database`, esta API e por último a `auth_lambda`.
 

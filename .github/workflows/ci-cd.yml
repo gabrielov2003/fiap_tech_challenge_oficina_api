@@ -114,6 +114,8 @@ jobs:
 
       - name: Aplica os manifestos no namespace do ambiente
         if: env.SKIP_AWS != 'true'
+        env:
+          ADMIN_PASSWORD_GITHUB: ${{ secrets.ADMIN_PASSWORD }}
         run: |
           ler() { aws ssm get-parameter --name "$1" --with-decryption --query Parameter.Value --output text; }
           DB_HOST=$(ler /oficina/db/host)
@@ -123,15 +125,16 @@ jobs:
           DB_PASSWORD=$(ler /oficina/db/password)
           JWT_SECRET_KEY=$(ler /oficina/$ENV/jwt_secret)
           WEBHOOK_TOKEN=$(ler /oficina/$ENV/webhook_token)
-          ADMIN_PASSWORD=$(ler /oficina/$ENV/admin_password)
+          ADMIN_PASSWORD=${ADMIN_PASSWORD_GITHUB:-$(ler /oficina/$ENV/admin_password)}
           for segredo in "$DB_PASSWORD" "$JWT_SECRET_KEY" "$WEBHOOK_TOKEN" "$ADMIN_PASSWORD"; do
             echo "::add-mask::$segredo"
           done
           CONTA=$(aws sts get-caller-identity --query Account --output text)
           IMAGE=$CONTA.dkr.ecr.$AWS_REGION.amazonaws.com/$REPOSITORIO_ECR:$GITHUB_SHA
           VERSION=$GITHUB_SHA
-          export DB_HOST DB_PORT DB_NAME DB_USER DB_PASSWORD JWT_SECRET_KEY WEBHOOK_TOKEN ADMIN_PASSWORD IMAGE VERSION
-          VARIAVEIS='${ENV} ${IMAGE} ${VERSION} ${DB_HOST} ${DB_PORT} ${DB_NAME} ${DB_USER} ${DB_PASSWORD} ${JWT_SECRET_KEY} ${WEBHOOK_TOKEN} ${ADMIN_PASSWORD}'
+          SECRET_HASH=$(printf '%s' "$DB_PASSWORD$JWT_SECRET_KEY$WEBHOOK_TOKEN$ADMIN_PASSWORD" | sha256sum | cut -c1-16)
+          export DB_HOST DB_PORT DB_NAME DB_USER DB_PASSWORD JWT_SECRET_KEY WEBHOOK_TOKEN ADMIN_PASSWORD IMAGE VERSION SECRET_HASH
+          VARIAVEIS='${ENV} ${IMAGE} ${VERSION} ${SECRET_HASH} ${DB_HOST} ${DB_PORT} ${DB_NAME} ${DB_USER} ${DB_PASSWORD} ${JWT_SECRET_KEY} ${WEBHOOK_TOKEN} ${ADMIN_PASSWORD}'
           for manifesto in namespace configmap secret deployment service hpa; do
             envsubst "$VARIAVEIS" < k8s/$manifesto.yaml | kubectl apply -f -
           done
