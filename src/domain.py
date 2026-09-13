@@ -14,6 +14,8 @@ TRANSICOES = {
     "Entregue": [],
 }
 
+STATUS_CLIENTE = ("ativo", "inativo")
+
 class DomainError(Exception):
     pass
 
@@ -55,10 +57,13 @@ class Validador:
         return placa.upper()
 
 class Cliente:
-    def __init__(self, documento, nome, id_cliente=None):
+    def __init__(self, documento, nome, id_cliente=None, status="ativo"):
+        if status not in STATUS_CLIENTE:
+            raise DomainError("Status do cliente inválido")
         self.id_cliente = id_cliente
         self.documento = Validador.validar_documento(documento)
         self.nome = nome
+        self.status = status
 
 class Veiculo:
     def __init__(self, placa, marca, modelo, ano, id_veiculo=None):

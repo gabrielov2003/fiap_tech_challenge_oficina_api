@@ -1,15 +1,42 @@
+import hmac
 import os
+from functools import wraps
+
 from flask import Blueprint, request, jsonify
-from flask_jwt_extended import jwt_required, create_access_token
+from flask_jwt_extended import jwt_required, create_access_token, get_jwt, get_jwt_identity
 from application import OficinaAppService
 from flasgger import swag_from
 
 api = Blueprint('api', __name__)
 
+ADMIN = 'admin'
+CLIENTE = 'cliente'
+
+
+def papel_requerido(*papeis):
+    def decorator(fn):
+        @wraps(fn)
+        @jwt_required()
+        def wrapper(*args, **kwargs):
+            if get_jwt().get('role') not in papeis:
+                return jsonify({"erro": "Acesso negado para este perfil"}), 403
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def id_cliente_autenticado():
+    return int(get_jwt_identity()) if get_jwt().get('role') == CLIENTE else None
+
+
 @api.route('/login', methods=['POST'])
 @swag_from({
     'tags': ['Login'],
-    'description': 'Rota para fazer login e retornar o Bearer Token',
+    'description': (
+        'Login de funcionários (perfil admin), retorna o Bearer Token. '
+        'Clientes se autenticam por CPF no API Gateway, rota POST /auth.'
+    ),
+    'security': [],
     'parameters': [{
         'name': 'body',
         'in': 'body',
@@ -37,11 +64,11 @@ def login():
     user_id = OficinaAppService.autenticar_usuario(username, senha)
     if not user_id:
         return jsonify({"erro": "Credenciais inválidas"}), 401
-    token = create_access_token(identity=user_id)
+    token = create_access_token(identity=user_id, additional_claims={"role": ADMIN})
     return jsonify(access_token=token)
 
 @api.route('/clientes', methods=['POST'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Clientes'],
     'description': 'Cadastra um novo cliente no sistema',
@@ -72,7 +99,7 @@ def post_cliente():
 
 
 @api.route('/clientes', methods=['GET'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Clientes'],
     'description': 'Lista todos os clientes cadastrados',
@@ -85,7 +112,7 @@ def listar_clientes():
 
 
 @api.route('/clientes/<int:id_cliente>', methods=['GET'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Clientes'],
     'description': 'Busca um cliente pelo ID',
@@ -103,7 +130,7 @@ def get_cliente(id_cliente):
 
 
 @api.route('/clientes/documento/<doc>', methods=['GET'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Clientes'],
     'description': 'Busca cliente pelo CPF ou CNPJ',
@@ -121,10 +148,10 @@ def get_cliente_por_documento(doc):
 
 
 @api.route('/clientes/<int:id_cliente>', methods=['PUT'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Clientes'],
-    'description': 'Atualiza os dados de um cliente',
+    'description': 'Atualiza os dados de um cliente. O status inativo bloqueia a autenticação por CPF.',
     'parameters': [
         {'name': 'id_cliente', 'in': 'path', 'type': 'integer', 'required': True},
         {
@@ -134,7 +161,8 @@ def get_cliente_por_documento(doc):
                 'required': ['nome', 'documento'],
                 'properties': {
                     'nome': {'type': 'string', 'example': 'Gabriel Vieira'},
-                    'documento': {'type': 'string', 'example': '12345678901'}
+                    'documento': {'type': 'string', 'example': '12345678901'},
+                    'status': {'type': 'string', 'enum': ['ativo', 'inativo'], 'example': 'ativo'}
                 }
             }
         }
@@ -147,7 +175,7 @@ def get_cliente_por_documento(doc):
 })
 def put_cliente(id_cliente):
     data = request.json
-    resultado = OficinaAppService.atualizar_cliente(id_cliente, data['nome'], data['documento'])
+    resultado = OficinaAppService.atualizar_cliente(id_cliente, data['nome'], data['documento'], data.get('status'))
     if isinstance(resultado, dict) and "erro" in resultado:
         return jsonify(resultado), 400
     if not resultado:
@@ -156,24 +184,28 @@ def put_cliente(id_cliente):
 
 
 @api.route('/clientes/<int:id_cliente>', methods=['DELETE'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Clientes'],
     'description': 'Remove um cliente pelo ID',
     'parameters': [{'name': 'id_cliente', 'in': 'path', 'type': 'integer', 'required': True}],
     'responses': {
         200: {'description': 'Cliente removido'},
-        404: {'description': 'Cliente não encontrado'}
+        404: {'description': 'Cliente não encontrado'},
+        409: {'description': 'Cliente possui ordens de serviço vinculadas'}
     }
 })
 def delete_cliente(id_cliente):
-    if not OficinaAppService.deletar_cliente(id_cliente):
+    resultado = OficinaAppService.deletar_cliente(id_cliente)
+    if isinstance(resultado, dict):
+        return jsonify(resultado), 409
+    if not resultado:
         return jsonify({"erro": "Cliente não encontrado"}), 404
     return jsonify({"mensagem": "Cliente removido"}), 200
 
 
 @api.route('/veiculos', methods=['POST'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Veículos'],
     'description': 'Cadastra um veículo',
@@ -206,7 +238,7 @@ def post_veiculo():
 
 
 @api.route('/veiculos', methods=['GET'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Veículos'],
     'description': 'Lista todos os veículos cadastrados',
@@ -219,7 +251,7 @@ def listar_veiculos():
 
 
 @api.route('/veiculos/<int:id_veiculo>', methods=['GET'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Veículos'],
     'description': 'Busca um veículo pelo ID',
@@ -237,7 +269,7 @@ def get_veiculo(id_veiculo):
 
 
 @api.route('/veiculos/placa/<placa>', methods=['GET'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Veículos'],
     'description': 'Busca veículo pela placa (formato antigo AAA9999 ou Mercosul AAA9A99)',
@@ -255,7 +287,7 @@ def get_veiculo_por_placa(placa):
 
 
 @api.route('/veiculos/<int:id_veiculo>', methods=['PUT'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Veículos'],
     'description': 'Atualiza os dados de um veículo',
@@ -294,24 +326,28 @@ def put_veiculo(id_veiculo):
 
 
 @api.route('/veiculos/<int:id_veiculo>', methods=['DELETE'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Veículos'],
     'description': 'Remove um veículo pelo ID',
     'parameters': [{'name': 'id_veiculo', 'in': 'path', 'type': 'integer', 'required': True}],
     'responses': {
         200: {'description': 'Veículo removido'},
-        404: {'description': 'Veículo não encontrado'}
+        404: {'description': 'Veículo não encontrado'},
+        409: {'description': 'Veículo possui ordens de serviço vinculadas'}
     }
 })
 def delete_veiculo(id_veiculo):
-    if not OficinaAppService.deletar_veiculo(id_veiculo):
+    resultado = OficinaAppService.deletar_veiculo(id_veiculo)
+    if isinstance(resultado, dict):
+        return jsonify(resultado), 409
+    if not resultado:
         return jsonify({"erro": "Veículo não encontrado"}), 404
     return jsonify({"mensagem": "Veículo removido"}), 200
 
 
 @api.route('/pecas', methods=['POST'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Peças'],
     'description': 'Cadastra uma peça no catálogo',
@@ -328,7 +364,8 @@ def delete_veiculo(id_veiculo):
         }
     }],
     'responses': {
-        201: {'description': 'Peça cadastrada'}
+        201: {'description': 'Peça cadastrada'},
+        400: {'description': 'Valor ou estoque inválido'}
     }
 })
 def post_peca():
@@ -336,11 +373,13 @@ def post_peca():
     resultado = OficinaAppService.cadastrar_peca(
         data['nome'], data['valor_unitario'], data.get('estoque', 0)
     )
+    if isinstance(resultado, dict):
+        return jsonify(resultado), 400
     return jsonify({"id_peca": resultado}), 201
 
 
 @api.route('/pecas', methods=['GET'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Peças'],
     'description': 'Lista todas as peças do catálogo',
@@ -353,7 +392,7 @@ def listar_pecas():
 
 
 @api.route('/pecas/<int:id_peca>', methods=['GET'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Peças'],
     'description': 'Busca uma peça pelo ID',
@@ -371,7 +410,7 @@ def get_peca(id_peca):
 
 
 @api.route('/pecas/<int:id_peca>', methods=['PUT'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Peças'],
     'description': 'Atualiza os dados de uma peça',
@@ -392,18 +431,22 @@ def get_peca(id_peca):
     ],
     'responses': {
         200: {'description': 'Peça atualizada'},
+        400: {'description': 'Valor ou estoque inválido'},
         404: {'description': 'Peça não encontrada'}
     }
 })
 def put_peca(id_peca):
     data = request.json
-    if not OficinaAppService.atualizar_peca(id_peca, data['nome'], data['valor_unitario'], data['estoque']):
+    resultado = OficinaAppService.atualizar_peca(id_peca, data['nome'], data['valor_unitario'], data['estoque'])
+    if isinstance(resultado, dict):
+        return jsonify(resultado), 400
+    if not resultado:
         return jsonify({"erro": "Peça não encontrada"}), 404
     return jsonify({"mensagem": "Peça atualizada"}), 200
 
 
 @api.route('/pecas/<int:id_peca>', methods=['DELETE'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Peças'],
     'description': 'Remove uma peça do catálogo',
@@ -414,13 +457,16 @@ def put_peca(id_peca):
     }
 })
 def delete_peca(id_peca):
-    if not OficinaAppService.deletar_peca(id_peca):
+    resultado = OficinaAppService.deletar_peca(id_peca)
+    if isinstance(resultado, dict):
+        return jsonify(resultado), 409
+    if not resultado:
         return jsonify({"erro": "Peça não encontrada"}), 404
     return jsonify({"mensagem": "Peça removida"}), 200
 
 
 @api.route('/servicos', methods=['POST'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Serviços'],
     'description': 'Cadastra um serviço no catálogo',
@@ -436,17 +482,20 @@ def delete_peca(id_peca):
         }
     }],
     'responses': {
-        201: {'description': 'Serviço cadastrado'}
+        201: {'description': 'Serviço cadastrado'},
+        400: {'description': 'Valor inválido'}
     }
 })
 def post_servico():
     data = request.json
     resultado = OficinaAppService.cadastrar_servico_catalogo(data['nome'], data['valor'])
+    if isinstance(resultado, dict):
+        return jsonify(resultado), 400
     return jsonify({"id_servico": resultado}), 201
 
 
 @api.route('/servicos', methods=['GET'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Serviços'],
     'description': 'Lista todos os serviços do catálogo',
@@ -459,7 +508,7 @@ def listar_servicos():
 
 
 @api.route('/servicos/<int:id_servico>', methods=['GET'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Serviços'],
     'description': 'Busca um serviço pelo ID',
@@ -477,7 +526,7 @@ def get_servico(id_servico):
 
 
 @api.route('/servicos/<int:id_servico>', methods=['PUT'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Serviços'],
     'description': 'Atualiza os dados de um serviço',
@@ -497,18 +546,22 @@ def get_servico(id_servico):
     ],
     'responses': {
         200: {'description': 'Serviço atualizado'},
+        400: {'description': 'Valor inválido'},
         404: {'description': 'Serviço não encontrado'}
     }
 })
 def put_servico(id_servico):
     data = request.json
-    if not OficinaAppService.atualizar_servico(id_servico, data['nome'], data['valor']):
+    resultado = OficinaAppService.atualizar_servico(id_servico, data['nome'], data['valor'])
+    if isinstance(resultado, dict):
+        return jsonify(resultado), 400
+    if not resultado:
         return jsonify({"erro": "Serviço não encontrado"}), 404
     return jsonify({"mensagem": "Serviço atualizado"}), 200
 
 
 @api.route('/servicos/<int:id_servico>', methods=['DELETE'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Serviços'],
     'description': 'Remove um serviço do catálogo',
@@ -519,21 +572,27 @@ def put_servico(id_servico):
     }
 })
 def delete_servico(id_servico):
-    if not OficinaAppService.deletar_servico(id_servico):
+    resultado = OficinaAppService.deletar_servico(id_servico)
+    if isinstance(resultado, dict):
+        return jsonify(resultado), 409
+    if not resultado:
         return jsonify({"erro": "Serviço não encontrado"}), 404
     return jsonify({"mensagem": "Serviço removido"}), 200
 
 
 @api.route('/os', methods=['POST'])
-@jwt_required()
+@papel_requerido(ADMIN, CLIENTE)
 @swag_from({
     'tags': ['Ordem de Serviço'],
-    'description': 'Cria uma nova ordem de serviço, opcionalmente já com peças e serviços',
+    'description': (
+        'Cria uma nova ordem de serviço, opcionalmente já com peças e serviços. '
+        'Com token de cliente (CPF), o id_cliente vem do próprio token e o campo é ignorado.'
+    ),
     'parameters': [{
         'name': 'body', 'in': 'body', 'required': True,
         'schema': {
             'type': 'object',
-            'required': ['id_cliente', 'id_veiculo'],
+            'required': ['id_veiculo'],
             'properties': {
                 'id_cliente': {'type': 'integer', 'example': 1},
                 'id_veiculo': {'type': 'integer', 'example': 2},
@@ -562,13 +621,16 @@ def delete_servico(id_servico):
     }],
     'responses': {
         201: {'description': 'OS criada'},
-        400: {'description': 'Erro'}
+        400: {'description': 'Dados inválidos, cliente ou veículo inexistente'}
     }
 })
 def criar_os():
-    data = request.json
+    data = request.json or {}
+    id_cliente = id_cliente_autenticado() or data.get('id_cliente')
+    if not id_cliente or not data.get('id_veiculo'):
+        return jsonify({"erro": "id_cliente e id_veiculo são obrigatórios"}), 400
     resultado = OficinaAppService.abrir_ordem_servico(
-        data['id_cliente'], data['id_veiculo'],
+        id_cliente, data['id_veiculo'],
         pecas=data.get('pecas'), servicos=data.get('servicos')
     )
     if isinstance(resultado, dict) and "erro" in resultado:
@@ -577,36 +639,39 @@ def criar_os():
 
 
 @api.route('/os', methods=['GET'])
-@jwt_required()
+@papel_requerido(ADMIN, CLIENTE)
 @swag_from({
     'tags': ['Ordem de Serviço'],
-    'description': 'Lista ordens de serviço ativas, ordenadas por prioridade de status',
+    'description': (
+        'Lista ordens de serviço ativas, ordenadas por prioridade de status e data de abertura. '
+        'Com token de cliente, lista apenas as ordens do próprio cliente.'
+    ),
     'responses': {
         200: {'description': 'Lista de OS ativas (exclui Finalizada, Entregue e Recusada)'}
     }
 })
 def listar_os():
-    return jsonify(OficinaAppService.listar_ordens()), 200
+    return jsonify(OficinaAppService.listar_ordens(id_cliente_autenticado())), 200
 
 
 @api.route('/os/tempo-medio', methods=['GET'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Ordem de Serviço'],
-    'description': 'Retorna o tempo médio de execução das OS finalizadas, em dias',
+    'description': 'Tempo médio de execução das OS entregues e tempo médio em cada status, em dias',
     'responses': {
-        200: {'description': 'Média em dias'}
+        200: {'description': 'Médias em dias, geral e por status'}
     }
 })
 def tempo_medio_os():
-    media = OficinaAppService.tempo_medio_execucao()
-    return jsonify({"media_dias": media}), 200
+    return jsonify(OficinaAppService.tempo_medio_execucao()), 200
 
 
 @api.route('/os/<int:id_os>', methods=['GET'])
 @swag_from({
     'tags': ['Ordem de Serviço'],
     'description': 'Retorna os dados completos da OS com orçamento consolidado (rota pública)',
+    'security': [],
     'parameters': [{'name': 'id_os', 'in': 'path', 'type': 'integer', 'required': True, 'example': 1}],
     'responses': {
         200: {'description': 'Dados completos da OS'},
@@ -624,6 +689,7 @@ def get_os(id_os):
 @swag_from({
     'tags': ['Ordem de Serviço'],
     'description': 'Retorna apenas o status atual da OS (rota pública)',
+    'security': [],
     'parameters': [{'name': 'id_os', 'in': 'path', 'type': 'integer', 'required': True, 'example': 1}],
     'responses': {
         200: {'description': 'Status atual da OS'},
@@ -637,15 +703,32 @@ def get_os_status(id_os):
     return jsonify({"id_os": id_os, "status": resultado["status"]}), 200
 
 
+@api.route('/os/<int:id_os>/historico', methods=['GET'])
+@papel_requerido(ADMIN)
+@swag_from({
+    'tags': ['Ordem de Serviço'],
+    'description': 'Histórico de status da OS, com a data de início de cada etapa',
+    'parameters': [{'name': 'id_os', 'in': 'path', 'type': 'integer', 'required': True, 'example': 1}],
+    'responses': {
+        200: {'description': 'Lista de status em ordem cronológica'},
+        404: {'description': 'OS não encontrada'}
+    }
+})
+def get_os_historico(id_os):
+    historico = OficinaAppService.historico_os(id_os)
+    if not historico:
+        return jsonify({"erro": "OS não encontrada"}), 404
+    return jsonify(historico), 200
+
+
 @api.route('/os/<int:id_os>/status', methods=['PUT'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Ordem de Serviço'],
     'description': (
-        'Avança o status da OS conforme o fluxo permitido: '
-        'Recebida → Em diagnóstico → Aguardando aprovação → '
-        '[Aprovado | Recusada | Solicitado alterações] → '
-        'Aprovado → [Em execução | Aguardando peças] → Em execução → Finalizada → Entregue'
+        'Avança o status da OS conforme o fluxo permitido: Recebida, Em diagnóstico, Aguardando aprovação, '
+        'e então Aprovado, Recusada ou Solicitado alterações (que volta para Em diagnóstico). '
+        'Aprovado segue para Em execução ou Aguardando peças, e depois Finalizada e Entregue.'
     ),
     'parameters': [
         {'name': 'id_os', 'in': 'path', 'type': 'integer', 'required': True, 'example': 1},
@@ -682,10 +765,13 @@ def atualizar_status(id_os):
 
 
 @api.route('/os/<int:id_os>/aprovacao', methods=['POST'])
-@jwt_required()
+@papel_requerido(ADMIN, CLIENTE)
 @swag_from({
     'tags': ['Ordem de Serviço'],
-    'description': 'Aprova ou recusa o orçamento de uma OS que esteja em "Aguardando aprovação"',
+    'description': (
+        'Aprova ou recusa o orçamento de uma OS que esteja em "Aguardando aprovação". '
+        'Com token de cliente, só é permitido para as ordens do próprio cliente.'
+    ),
     'parameters': [
         {'name': 'id_os', 'in': 'path', 'type': 'integer', 'required': True, 'example': 1},
         {
@@ -700,14 +786,18 @@ def atualizar_status(id_os):
         }
     ],
     'responses': {
-        200: {'description': 'Orçamento aprovado (status → Aprovado) ou recusado (status → Recusada)'},
-        400: {'description': 'OS não está aguardando aprovação ou campo ausente'}
+        200: {'description': 'Orçamento aprovado (status Aprovado) ou recusado (status Recusada)'},
+        400: {'description': 'OS não está aguardando aprovação ou campo ausente'},
+        403: {'description': 'OS não pertence ao cliente autenticado'}
     }
 })
 def aprovar_orcamento(id_os):
     data = request.json or {}
     if 'aprovado' not in data:
         return jsonify({"erro": "'aprovado' é obrigatório"}), 400
+    id_cliente = id_cliente_autenticado()
+    if id_cliente and not OficinaAppService.pertence_ao_cliente(id_os, id_cliente):
+        return jsonify({"erro": "Acesso negado a esta ordem de serviço"}), 403
     resultado = OficinaAppService.aprovar_orcamento(id_os, data['aprovado'])
     if isinstance(resultado, dict) and "erro" in resultado:
         return jsonify(resultado), 400
@@ -716,7 +806,7 @@ def aprovar_orcamento(id_os):
 
 
 @api.route('/os/<int:id_os>/servicos', methods=['POST'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Ordem de Serviço'],
     'description': 'Adiciona um serviço a uma OS existente',
@@ -736,7 +826,7 @@ def aprovar_orcamento(id_os):
     ],
     'responses': {
         201: {'description': 'Serviço adicionado'},
-        400: {'description': 'Erro'}
+        400: {'description': 'OS inexistente ou valor inválido'}
     }
 })
 def adicionar_servico(id_os):
@@ -748,7 +838,7 @@ def adicionar_servico(id_os):
 
 
 @api.route('/os/<int:id_os>/pecas', methods=['POST'])
-@jwt_required()
+@papel_requerido(ADMIN)
 @swag_from({
     'tags': ['Ordem de Serviço'],
     'description': 'Adiciona uma peça a uma OS existente',
@@ -768,7 +858,7 @@ def adicionar_servico(id_os):
     ],
     'responses': {
         201: {'description': 'Peça adicionada'},
-        400: {'description': 'Erro'}
+        400: {'description': 'OS inexistente ou valor inválido'}
     }
 })
 def adicionar_peca(id_os):
@@ -786,6 +876,7 @@ def adicionar_peca(id_os):
         'Atualiza o status de uma OS via webhook externo. '
         'Autenticado pelo header X-Webhook-Token ou campo "token" no body.'
     ),
+    'security': [],
     'parameters': [{
         'name': 'body', 'in': 'body', 'required': True,
         'schema': {
@@ -805,17 +896,50 @@ def adicionar_peca(id_os):
     }
 })
 def webhook_status():
-    token = request.headers.get('X-Webhook-Token') or (request.json or {}).get('token')
-    if token != os.getenv('WEBHOOK_TOKEN', 'webhook-secret'):
-        return jsonify({"erro": "Token inválido"}), 401
     data = request.json or {}
+    token = request.headers.get('X-Webhook-Token') or data.get('token') or ''
+    if not hmac.compare_digest(token.encode(), os.getenv('WEBHOOK_TOKEN', 'webhook-secret').encode()):
+        OficinaAppService.registrar_erro_integracao('webhook', 'token_invalido')
+        return jsonify({"erro": "Token inválido"}), 401
     id_os = data.get('id_os')
     novo_status = data.get('status')
     if not id_os or not novo_status:
+        OficinaAppService.registrar_erro_integracao('webhook', 'campos_ausentes')
         return jsonify({"erro": "id_os e status são obrigatórios"}), 400
     resultado = OficinaAppService.atualizar_progresso_os(id_os, novo_status)
     if isinstance(resultado, dict) and "erro" in resultado:
+        OficinaAppService.registrar_erro_integracao('webhook', 'transicao_invalida')
         return jsonify(resultado), 400
     if resultado is False:
+        OficinaAppService.registrar_erro_integracao('webhook', 'os_nao_encontrada')
         return jsonify({"erro": "OS não encontrada ou transição inválida"}), 400
     return jsonify({"mensagem": "Status atualizado"}), 200
+
+
+@api.route('/health', methods=['GET'])
+@swag_from({
+    'tags': ['Saúde'],
+    'description': 'Liveness: indica que a aplicação está no ar',
+    'security': [],
+    'responses': {
+        200: {'description': 'Aplicação no ar'}
+    }
+})
+def health():
+    return jsonify({"status": "ok"}), 200
+
+
+@api.route('/ready', methods=['GET'])
+@swag_from({
+    'tags': ['Saúde'],
+    'description': 'Readiness: indica que a aplicação consegue acessar o banco de dados',
+    'security': [],
+    'responses': {
+        200: {'description': 'Pronta para receber tráfego'},
+        503: {'description': 'Banco de dados indisponível'}
+    }
+})
+def ready():
+    if not OficinaAppService.banco_disponivel():
+        return jsonify({"status": "indisponivel"}), 503
+    return jsonify({"status": "ok"}), 200

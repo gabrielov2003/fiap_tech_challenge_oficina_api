@@ -2,14 +2,38 @@ name: CI/CD
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/oficina-api
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ENV: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+  REPOSITORIO_ECR: oficina-api
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: oficina
+          POSTGRES_USER: oficina
+          POSTGRES_PASSWORD: oficina
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U oficina -d oficina"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_NAME: oficina
+      DB_USER: oficina
+      DB_PASSWORD: oficina
     steps:
       - uses: actions/checkout@v4
 
@@ -17,63 +41,114 @@ jobs:
         with:
           python-version: '3.11'
 
-      - run: python -m pip install -r requirements.txt
+      - run: python -m pip install -r requirements.txt -r requirements-dev.txt
 
-      - run: python -m pytest tests/unit_tests.py -v
+      - name: Testes
+        run: python -m pytest tests/unit_tests.py -v
+
+      - name: Análise de segurança (Bandit)
+        run: python -m bandit -r src -ll -ii
 
   build:
     needs: test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    permissions:
-      contents: read
-      packages: write
+    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verifica credenciais AWS
+        run: |
+          if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
+            echo "Credenciais AWS não configuradas, build ignorado."
+            echo "SKIP_AWS=true" >> $GITHUB_ENV
+          fi
 
-      - uses: docker/build-push-action@v5
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: env.SKIP_AWS != 'true'
         with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.sha }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        if: env.SKIP_AWS != 'true'
+        id: ecr
+
+      - name: Build e push da imagem
+        if: env.SKIP_AWS != 'true'
+        env:
+          IMAGEM: ${{ steps.ecr.outputs.registry }}/oficina-api
+        run: |
+          docker build -t $IMAGEM:${{ github.sha }} -t $IMAGEM:${{ env.ENV }} .
+          docker push --all-tags $IMAGEM
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'push'
+    environment:
+      name: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+      url: ${{ steps.publica.outputs.url }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: azure/setup-kubectl@v4
-
-      - name: Configure kubectl
+      - name: Verifica credenciais AWS
         run: |
-          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > /tmp/kubeconfig
-          echo "KUBECONFIG=/tmp/kubeconfig" >> $GITHUB_ENV
-          if ! kubectl cluster-info > /dev/null 2>&1; then
-            echo "Cluster inacessível — etapa de deploy ignorada."
-            echo "SKIP_DEPLOY=true" >> $GITHUB_ENV
+          if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
+            echo "Credenciais AWS não configuradas, deploy ignorado."
+            echo "SKIP_AWS=true" >> $GITHUB_ENV
           fi
 
-      - name: Apply K8s manifests
-        if: env.SKIP_DEPLOY != 'true'
-        env:
-          JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
-          WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
-        run: |
-          envsubst < k8s/secret.yaml | kubectl apply -f -
-          kubectl apply -f k8s/configmap.yaml -f k8s/pvc.yaml -f k8s/deployment.yaml -f k8s/service.yaml -f k8s/hpa.yaml
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: env.SKIP_AWS != 'true'
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Update image and rollout
-        if: env.SKIP_DEPLOY != 'true'
+      - name: Configura kubectl
+        if: env.SKIP_AWS != 'true'
         run: |
-          kubectl set image deployment/oficina-api oficina-api=${{ env.IMAGE }}:${{ github.sha }}
-          kubectl rollout status deployment/oficina-api --timeout=120s
+          CLUSTER=$(aws ssm get-parameter --name /oficina/eks/cluster_name --query Parameter.Value --output text)
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER"
+
+      - name: Aplica os manifestos no namespace do ambiente
+        if: env.SKIP_AWS != 'true'
+        run: |
+          ler() { aws ssm get-parameter --name "$1" --with-decryption --query Parameter.Value --output text; }
+          DB_HOST=$(ler /oficina/db/host)
+          DB_PORT=$(ler /oficina/db/port)
+          DB_NAME=$(ler /oficina/db/name)
+          DB_USER=$(ler /oficina/db/username)
+          DB_PASSWORD=$(ler /oficina/db/password)
+          JWT_SECRET_KEY=$(ler /oficina/$ENV/jwt_secret)
+          WEBHOOK_TOKEN=$(ler /oficina/$ENV/webhook_token)
+          ADMIN_PASSWORD=$(ler /oficina/$ENV/admin_password)
+          for segredo in "$DB_PASSWORD" "$JWT_SECRET_KEY" "$WEBHOOK_TOKEN" "$ADMIN_PASSWORD"; do
+            echo "::add-mask::$segredo"
+          done
+          CONTA=$(aws sts get-caller-identity --query Account --output text)
+          IMAGE=$CONTA.dkr.ecr.$AWS_REGION.amazonaws.com/$REPOSITORIO_ECR:$GITHUB_SHA
+          VERSION=$GITHUB_SHA
+          export DB_HOST DB_PORT DB_NAME DB_USER DB_PASSWORD JWT_SECRET_KEY WEBHOOK_TOKEN ADMIN_PASSWORD IMAGE VERSION
+          VARIAVEIS='${ENV} ${IMAGE} ${VERSION} ${DB_HOST} ${DB_PORT} ${DB_NAME} ${DB_USER} ${DB_PASSWORD} ${JWT_SECRET_KEY} ${WEBHOOK_TOKEN} ${ADMIN_PASSWORD}'
+          for manifesto in namespace configmap secret deployment service hpa; do
+            envsubst "$VARIAVEIS" < k8s/$manifesto.yaml | kubectl apply -f -
+          done
+          kubectl rollout status deployment/oficina-api -n "$ENV" --timeout=300s
+
+      - name: Publica a URL da API para o API Gateway
+        id: publica
+        if: env.SKIP_AWS != 'true'
+        run: |
+          for tentativa in $(seq 1 30); do
+            HOST=$(kubectl get service oficina-service -n "$ENV" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            [ -n "$HOST" ] && break
+            sleep 10
+          done
+          if [ -z "$HOST" ]; then
+            echo "O LoadBalancer ainda não recebeu um hostname."
+            exit 1
+          fi
+          aws ssm put-parameter --name "/oficina/$ENV/api_url" --value "http://$HOST" --type String --overwrite
+          echo "url=http://$HOST/apidocs/" >> $GITHUB_OUTPUT

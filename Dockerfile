@@ -10,11 +10,10 @@ RUN useradd -m appuser
 WORKDIR /app
 
 COPY --from=builder /install /usr/local
-COPY . .
+COPY src ./src
 
-RUN chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 5000
 
-CMD ["python", "src/app.py"]
+CMD ["ddtrace-run", "gunicorn", "--chdir", "src", "--workers", "2", "--bind", "0.0.0.0:5000", "app:create_app()"]

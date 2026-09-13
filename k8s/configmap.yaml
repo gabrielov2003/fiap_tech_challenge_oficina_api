@@ -2,6 +2,11 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: oficina-config
+  namespace: ${ENV}
 data:
   FLASK_DEBUG: "0"
-  DATABASE_PATH: "/app/instance/database.db"
+  DB_HOST: "${DB_HOST}"
+  DB_PORT: "${DB_PORT}"
+  DB_NAME: "${DB_NAME}"
+  DB_SCHEMA: "${ENV}"
+  DD_LOGS_INJECTION: "true"

@@ -4,6 +4,10 @@ import random
 import string
 import sys
 import os
+import time
+import uuid
+
+import jwt
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
@@ -38,9 +42,9 @@ def gerar_placa():
 class TestAPI(unittest.TestCase):
 
     def setUp(self):
-        app = create_app()
-        app.config['TESTING'] = True
-        self.client = app.test_client()
+        self.app = create_app()
+        self.app.config['TESTING'] = True
+        self.client = self.app.test_client()
 
         # Login
         response = self.client.post(
@@ -54,6 +58,15 @@ class TestAPI(unittest.TestCase):
             'Authorization': f'Bearer {self.token}',
             'Content-Type': 'application/json'
         }
+
+    def headers_cliente(self, id_cliente, cpf):
+        agora = int(time.time())
+        claims = {
+            "sub": str(id_cliente), "role": "cliente", "cpf": cpf, "type": "access", "fresh": False,
+            "jti": str(uuid.uuid4()), "iat": agora, "nbf": agora, "exp": agora + 3600
+        }
+        token = jwt.encode(claims, self.app.config['JWT_SECRET_KEY'], algorithm="HS256")
+        return {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
 
     def criar_cliente(self):
         cpf = gerar_cpf()
@@ -91,6 +104,10 @@ class TestAPI(unittest.TestCase):
             })
         )
         return response.get_json()['id_os']
+
+    def avancar_status(self, id_os, *status_lista):
+        for status in status_lista:
+            self.client.put(f'/api/os/{id_os}/status', headers=self.headers, data=json.dumps({"status": status}))
 
 
     def test_login(self):
@@ -537,6 +554,157 @@ class TestAPI(unittest.TestCase):
         response = self.client.get('/api/os/tempo-medio', headers=self.headers)
         self.assertEqual(response.status_code, 200)
         self.assertIn('media_dias', response.get_json())
+        self.assertIn('por_status', response.get_json())
+
+    def test_token_admin_tem_papel_admin(self):
+        claims = jwt.decode(self.token, self.app.config['JWT_SECRET_KEY'], algorithms=["HS256"])
+        self.assertEqual(claims['role'], 'admin')
+
+    def test_cliente_nao_acessa_rota_administrativa(self):
+        cpf, id_cliente = self.criar_cliente()
+        response = self.client.get('/api/clientes', headers=self.headers_cliente(id_cliente, cpf))
+        self.assertEqual(response.status_code, 403)
+
+    def test_cliente_abre_propria_os(self):
+        cpf, id_cliente = self.criar_cliente()
+        _, id_veiculo = self.criar_veiculo()
+
+        response = self.client.post(
+            '/api/os',
+            headers=self.headers_cliente(id_cliente, cpf),
+            data=json.dumps({"id_veiculo": id_veiculo})
+        )
+        self.assertEqual(response.status_code, 201)
+
+        os_data = self.client.get(f"/api/os/{response.get_json()['id_os']}").get_json()
+        self.assertEqual(os_data['id_cliente'], id_cliente)
+
+    def test_cliente_lista_apenas_as_proprias_os(self):
+        cpf, id_cliente = self.criar_cliente()
+        _, outro_cliente = self.criar_cliente()
+        _, id_veiculo = self.criar_veiculo()
+        minha_os = self.criar_os(id_cliente, id_veiculo)
+        self.criar_os(outro_cliente, id_veiculo)
+
+        ordens = self.client.get('/api/os', headers=self.headers_cliente(id_cliente, cpf)).get_json()
+        self.assertEqual({o['id_cliente'] for o in ordens}, {id_cliente})
+        self.assertIn(minha_os, [o['id_os'] for o in ordens])
+
+    def test_cliente_aprova_propria_os(self):
+        cpf, id_cliente = self.criar_cliente()
+        _, id_veiculo = self.criar_veiculo()
+        id_os = self.criar_os(id_cliente, id_veiculo)
+        self.avancar_status(id_os, "Em diagnóstico", "Aguardando aprovação")
+
+        response = self.client.post(
+            f'/api/os/{id_os}/aprovacao',
+            headers=self.headers_cliente(id_cliente, cpf),
+            data=json.dumps({"aprovado": True})
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_cliente_nao_aprova_os_de_outro_cliente(self):
+        cpf, id_cliente = self.criar_cliente()
+        _, dono = self.criar_cliente()
+        _, id_veiculo = self.criar_veiculo()
+        id_os = self.criar_os(dono, id_veiculo)
+        self.avancar_status(id_os, "Em diagnóstico", "Aguardando aprovação")
+
+        response = self.client.post(
+            f'/api/os/{id_os}/aprovacao',
+            headers=self.headers_cliente(id_cliente, cpf),
+            data=json.dumps({"aprovado": True})
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_historico_e_tempo_medio_por_status(self):
+        _, id_cliente = self.criar_cliente()
+        _, id_veiculo = self.criar_veiculo()
+        id_os = self.criar_os(id_cliente, id_veiculo)
+        self.avancar_status(id_os, "Em diagnóstico", "Aguardando aprovação")
+
+        historico = self.client.get(f'/api/os/{id_os}/historico', headers=self.headers).get_json()
+        self.assertEqual([h['status'] for h in historico], ["Recebida", "Em diagnóstico", "Aguardando aprovação"])
+
+        tempos = self.client.get('/api/os/tempo-medio', headers=self.headers).get_json()
+        self.assertIn("Recebida", tempos['por_status'])
+        self.assertIn("Em diagnóstico", tempos['por_status'])
+
+    def test_documento_duplicado(self):
+        cpf, _ = self.criar_cliente()
+        response = self.client.post(
+            '/api/clientes',
+            headers=self.headers,
+            data=json.dumps({"documento": cpf, "nome": "Outro Nome"})
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_placa_duplicada(self):
+        placa, _ = self.criar_veiculo()
+        response = self.client.post(
+            '/api/veiculos',
+            headers=self.headers,
+            data=json.dumps({"placa": placa, "marca": "Fiat", "modelo": "Uno", "ano": 2010})
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_os_com_cliente_inexistente(self):
+        _, id_veiculo = self.criar_veiculo()
+        response = self.client.post(
+            '/api/os',
+            headers=self.headers,
+            data=json.dumps({"id_cliente": 999999999, "id_veiculo": id_veiculo})
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_adicionar_peca_em_os_inexistente(self):
+        response = self.client.post(
+            '/api/os/999999999/pecas',
+            headers=self.headers,
+            data=json.dumps({"peca": "Filtro", "valor_total": 10})
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_deletar_cliente_com_os_vinculada(self):
+        _, id_cliente = self.criar_cliente()
+        _, id_veiculo = self.criar_veiculo()
+        self.criar_os(id_cliente, id_veiculo)
+
+        response = self.client.delete(f'/api/clientes/{id_cliente}', headers=self.headers)
+        self.assertEqual(response.status_code, 409)
+
+    def test_inativar_cliente(self):
+        cpf, id_cliente = self.criar_cliente()
+        response = self.client.put(
+            f'/api/clientes/{id_cliente}',
+            headers=self.headers,
+            data=json.dumps({"nome": "Gabriel Vieira", "documento": cpf, "status": "inativo"})
+        )
+        self.assertEqual(response.status_code, 200)
+
+        cliente = self.client.get(f'/api/clientes/{id_cliente}', headers=self.headers).get_json()
+        self.assertEqual(cliente['status'], 'inativo')
+
+    def test_status_cliente_invalido(self):
+        cpf, id_cliente = self.criar_cliente()
+        response = self.client.put(
+            f'/api/clientes/{id_cliente}',
+            headers=self.headers,
+            data=json.dumps({"nome": "Gabriel Vieira", "documento": cpf, "status": "bloqueado"})
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_health_e_ready(self):
+        self.assertEqual(self.client.get('/api/health').status_code, 200)
+        self.assertEqual(self.client.get('/api/ready').status_code, 200)
+
+    def test_correlation_id_propagado(self):
+        response = self.client.get('/api/health', headers={'X-Correlation-ID': 'teste-correlacao'})
+        self.assertEqual(response.headers['X-Correlation-ID'], 'teste-correlacao')
+
+    def test_correlation_id_gerado(self):
+        response = self.client.get('/api/health')
+        self.assertTrue(response.headers.get('X-Correlation-ID'))
 
 
 if __name__ == '__main__':
