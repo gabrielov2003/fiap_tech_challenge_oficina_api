@@ -7,7 +7,7 @@ from datadog.dogstatsd import DogStatsd
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
-from werkzeug.security import generate_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from domain import DomainError
 from ports import (ClienteRepositoryPort, VeiculoRepositoryPort, PecaRepositoryPort, ServicoRepositoryPort,
@@ -150,11 +150,18 @@ class Infrastructure:
             cursor.execute('SELECT pg_advisory_xact_lock(%s)', (TRAVA_MIGRACAO,))
             cursor.execute(sql.SQL('CREATE SCHEMA IF NOT EXISTS {}').format(sql.Identifier(DB_SCHEMA)))
             cursor.execute(SCHEMA_SQL)
-            cursor.execute('SELECT 1 FROM usuario WHERE username = %s', ('admin',))
-            if cursor.fetchone() is None:
+            cursor.execute('SELECT senha_hash FROM usuario WHERE username = %s', ('admin',))
+            admin = cursor.fetchone()
+            senha = os.getenv('ADMIN_PASSWORD')
+            if admin is None:
                 cursor.execute(
                     'INSERT INTO usuario (username, senha_hash) VALUES (%s, %s)',
-                    ('admin', generate_password_hash(os.getenv('ADMIN_PASSWORD', 'admin123')))
+                    ('admin', generate_password_hash(senha or 'admin123'))
+                )
+            elif senha and not check_password_hash(admin[0], senha):
+                cursor.execute(
+                    'UPDATE usuario SET senha_hash = %s WHERE username = %s',
+                    (generate_password_hash(senha), 'admin')
                 )
 
     @classmethod
