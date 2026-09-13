@@ -35,12 +35,21 @@ def create_app():
 
     JWTManager(app)
     Swagger(app, template={
+        'info': {
+            'title': 'API Oficina',
+            'version': '3.0',
+            'description': (
+                'Funcionários fazem login em POST /api/login. Clientes se autenticam com o CPF '
+                'em POST /auth, rota do API Gateway atendida pela Lambda. '
+                'Use o token no botão Authorize.'
+            )
+        },
         'securityDefinitions': {
             'Bearer': {
                 'type': 'apiKey',
                 'name': 'Authorization',
                 'in': 'header',
-                'description': 'Informe: Bearer <token>'
+                'description': 'Informe `Bearer <token>`'
             }
         },
         'security': [{'Bearer': []}]
