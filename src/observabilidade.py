@@ -39,6 +39,7 @@ def configurar_logs():
     raiz.handlers = [handler]
     raiz.setLevel(os.getenv('LOG_LEVEL', 'INFO'))
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
+    logging.getLogger('datadog.dogstatsd').setLevel(logging.ERROR)
 
 
 def registrar_rastreamento(app):
