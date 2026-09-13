@@ -81,7 +81,7 @@ def login():
             'required': ['nome', 'documento'],
             'properties': {
                 'nome': {'type': 'string', 'example': 'Gabriel Vieira'},
-                'documento': {'type': 'string', 'example': '12345678901'}
+                'documento': {'type': 'string', 'example': '12345678909'}
             }
         }
     }],
@@ -134,7 +134,7 @@ def get_cliente(id_cliente):
 @swag_from({
     'tags': ['Clientes'],
     'description': 'Busca cliente pelo CPF ou CNPJ',
-    'parameters': [{'name': 'doc', 'in': 'path', 'type': 'string', 'required': True, 'example': '12345678901'}],
+    'parameters': [{'name': 'doc', 'in': 'path', 'type': 'string', 'required': True, 'example': '12345678909'}],
     'responses': {
         200: {'description': 'Dados do cliente'},
         404: {'description': 'Cliente não encontrado'}
@@ -161,7 +161,7 @@ def get_cliente_por_documento(doc):
                 'required': ['nome', 'documento'],
                 'properties': {
                     'nome': {'type': 'string', 'example': 'Gabriel Vieira'},
-                    'documento': {'type': 'string', 'example': '12345678901'},
+                    'documento': {'type': 'string', 'example': '12345678909'},
                     'status': {'type': 'string', 'enum': ['ativo', 'inativo'], 'example': 'ativo'}
                 }
             }
@@ -728,7 +728,8 @@ def get_os_historico(id_os):
     'description': (
         'Avança o status da OS conforme o fluxo permitido: Recebida, Em diagnóstico, Aguardando aprovação, '
         'e então Aprovado, Recusada ou Solicitado alterações (que volta para Em diagnóstico). '
-        'Aprovado segue para Em execução ou Aguardando peças, e depois Finalizada e Entregue.'
+        'Aprovado segue para Em execução ou Aguardando peças, que também pode ir para Recusada. '
+        'Depois vêm Finalizada e Entregue.'
     ),
     'parameters': [
         {'name': 'id_os', 'in': 'path', 'type': 'integer', 'required': True, 'example': 1},
@@ -740,7 +741,7 @@ def get_os_historico(id_os):
                 'properties': {
                     'status': {
                         'type': 'string',
-                        'enum': ['Em diagnóstico', 'Aguardando aprovação', 'Aprovado',
+                        'enum': ['Em diagnóstico', 'Aguardando aprovação', 'Aprovado', 'Recusada',
                                  'Solicitado alterações', 'Aguardando peças',
                                  'Em execução', 'Finalizada', 'Entregue'],
                         'example': 'Em diagnóstico'
