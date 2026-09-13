@@ -1,0 +1,32 @@
+services:
+  api-oficina:
+    environment:
+      DD_AGENT_HOST: datadog
+      DD_TRACE_ENABLED: "true"
+      DD_ENV: local
+      DD_SERVICE: oficina-api
+      DD_LOGS_INJECTION: "true"
+    labels:
+      com.datadoghq.ad.logs: '[{"source": "python", "service": "oficina-api"}]'
+      com.datadoghq.ad.checks: '{"http_check": {"instances": [{"name": "oficina-api", "url": "http://%%host%%:5000/api/health", "tags": ["service:oficina-api", "env:local"]}]}}'
+    depends_on:
+      datadog:
+        condition: service_started
+
+  datadog:
+    image: gcr.io/datadoghq/agent:7
+    container_name: oficina_datadog
+    environment:
+      DD_API_KEY: ${DD_API_KEY:?defina DD_API_KEY no arquivo .env}
+      DD_SITE: ${DD_SITE:-datadoghq.com}
+      DD_HOSTNAME: oficina-local
+      DD_ENV: local
+      DD_APM_ENABLED: "true"
+      DD_APM_NON_LOCAL_TRAFFIC: "true"
+      DD_DOGSTATSD_NON_LOCAL_TRAFFIC: "true"
+      DD_LOGS_ENABLED: "true"
+      DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /proc/:/host/proc/:ro
+      - /sys/fs/cgroup/:/host/sys/fs/cgroup:ro
