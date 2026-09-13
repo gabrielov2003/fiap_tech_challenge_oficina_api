@@ -112,12 +112,23 @@ Pré-requisitos: Git, Docker e Docker Compose, e Python 3.11+ para rodar os test
    | `JWT_SECRET_KEY` | Chave de assinatura dos tokens JWT | |
    | `WEBHOOK_TOKEN` | Token de autenticação do webhook | |
    | `ADMIN_PASSWORD` | Senha do usuário admin criado na primeira inicialização | `admin123` |
+   | `DD_API_KEY`, `DD_SITE` | Chave e site do Datadog, usados apenas pelo agente local | `datadoghq.com` |
 3. Suba o banco e a API:
    ```bash
    docker compose up --build
    ```
 4. A API fica em `http://localhost:5000` e o Swagger em `http://localhost:5000/apidocs/`.
 5. Faça login com `POST /api/login`, body `{"username": "admin", "senha": "admin123"}`, e use o token no header `Authorization: Bearer <token>` (no Swagger, pelo botão Authorize).
+
+### Monitoramento local com Datadog
+
+O arquivo `docker-compose.datadog.yml` sobe o agente do Datadog junto com a API, com APM, coleta dos logs dos containers, métricas customizadas e o healthcheck. Preencha `DD_API_KEY` e `DD_SITE` no `.env` e rode:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.datadog.yml up -d --build
+```
+
+Os dados chegam no Datadog com a tag `env:local`.
 
 ## Testes automatizados
 
