@@ -46,7 +46,7 @@ def id_cliente_autenticado():
             'required': ['username', 'senha'],
             'properties': {
                 'username': {'type': 'string', 'example': 'admin'},
-                'senha': {'type': 'string', 'example': 'admin123'}
+                'senha': {'type': 'string', 'example': 'senha_do_admin'}
             }
         }
     }],

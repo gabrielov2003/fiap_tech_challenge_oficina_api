@@ -12,6 +12,7 @@ import jwt
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
 from app import create_app
+from infrastructure import Infrastructure
 
 
 def gerar_cpf():
@@ -118,6 +119,25 @@ class TestAPI(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertIn('access_token', response.get_json())
+
+    def test_senha_do_admin_atualizada_pela_variavel(self):
+        anterior = os.environ.get('ADMIN_PASSWORD')
+        os.environ['ADMIN_PASSWORD'] = 'nova_senha_do_admin'
+        try:
+            Infrastructure.init_db()
+            nova = self.client.post('/api/login', content_type='application/json',
+                                    data=json.dumps({"username": "admin", "senha": "nova_senha_do_admin"}))
+            antiga = self.client.post('/api/login', content_type='application/json',
+                                      data=json.dumps({"username": "admin", "senha": "admin123"}))
+        finally:
+            os.environ['ADMIN_PASSWORD'] = 'admin123'
+            Infrastructure.init_db()
+            if anterior is None:
+                del os.environ['ADMIN_PASSWORD']
+            else:
+                os.environ['ADMIN_PASSWORD'] = anterior
+        self.assertEqual(nova.status_code, 200)
+        self.assertEqual(antiga.status_code, 401)
 
     def test_criar_cliente(self):
         cpf, _ = self.criar_cliente()
