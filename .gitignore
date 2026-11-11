@@ -10,3 +10,12 @@ __pycache__/
 .env
 .idea/
 *.egg-info/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+override.tf
+*_override.tf
+.coverage
+coverage.xml
+htmlcov/

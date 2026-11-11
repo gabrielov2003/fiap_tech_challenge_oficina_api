@@ -1,8 +1,6 @@
-import hmac
-import os
 from functools import wraps
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 from flask_jwt_extended import jwt_required, create_access_token, get_jwt, get_jwt_identity
 from application import OficinaAppService
 from flasgger import swag_from
@@ -11,6 +9,7 @@ api = Blueprint('api', __name__)
 
 ADMIN = 'admin'
 CLIENTE = 'cliente'
+SERVICO = 'servico'
 
 
 def papel_requerido(*papeis):
@@ -130,10 +129,13 @@ def get_cliente(id_cliente):
 
 
 @api.route('/clientes/documento/<doc>', methods=['GET'])
-@papel_requerido(ADMIN)
+@papel_requerido(ADMIN, SERVICO)
 @swag_from({
     'tags': ['Clientes'],
-    'description': 'Busca cliente pelo CPF ou CNPJ',
+    'description': (
+        'Busca cliente pelo CPF ou CNPJ. Também é usada pela Lambda de autenticação, '
+        'com um token de serviço, para conferir se o cliente existe e está ativo.'
+    ),
     'parameters': [{'name': 'doc', 'in': 'path', 'type': 'string', 'required': True, 'example': '12345678909'}],
     'responses': {
         200: {'description': 'Dados do cliente'},
@@ -585,7 +587,8 @@ def delete_servico(id_servico):
 @swag_from({
     'tags': ['Ordem de Serviço'],
     'description': (
-        'Cria uma nova ordem de serviço, opcionalmente já com peças e serviços. '
+        'Abre a ordem de serviço com as peças e serviços solicitados e inicia a Saga: '
+        'o Billing Service gera o orçamento, o cliente aprova e paga, e o Execution Service executa. '
         'Com token de cliente (CPF), o id_cliente vem do próprio token e o campo é ignorado.'
     ),
     'parameters': [{
@@ -620,8 +623,8 @@ def delete_servico(id_servico):
         }
     }],
     'responses': {
-        201: {'description': 'OS criada'},
-        400: {'description': 'Dados inválidos, cliente ou veículo inexistente'}
+        201: {'description': 'OS criada com status Recebida'},
+        400: {'description': 'Sem peças e serviços, dados inválidos, cliente ou veículo inexistente'}
     }
 })
 def criar_os():
@@ -631,7 +634,7 @@ def criar_os():
         return jsonify({"erro": "id_cliente e id_veiculo são obrigatórios"}), 400
     resultado = OficinaAppService.abrir_ordem_servico(
         id_cliente, data['id_veiculo'],
-        pecas=data.get('pecas'), servicos=data.get('servicos')
+        pecas=data.get('pecas'), servicos=data.get('servicos'), correlation_id=g.get('correlation_id')
     )
     if isinstance(resultado, dict) and "erro" in resultado:
         return jsonify(resultado), 400
@@ -726,10 +729,9 @@ def get_os_historico(id_os):
 @swag_from({
     'tags': ['Ordem de Serviço'],
     'description': (
-        'Avança o status da OS conforme o fluxo permitido: Recebida, Em diagnóstico, Aguardando aprovação, '
-        'e então Aprovado, Recusada ou Solicitado alterações (que volta para Em diagnóstico). '
-        'Aprovado segue para Em execução ou Aguardando peças, que também pode ir para Recusada. '
-        'Depois vêm Finalizada e Entregue.'
+        'Marca a entrega da OS ao cliente. Os demais status são controlados pela Saga: '
+        'Recebida, Aguardando aprovação, Aguardando pagamento, Aprovado, Em diagnóstico, '
+        'Aguardando peças, Em execução e Finalizada, com Recusada e Cancelada como encerramentos.'
     ),
     'parameters': [
         {'name': 'id_os', 'in': 'path', 'type': 'integer', 'required': True, 'example': 1},
@@ -741,10 +743,8 @@ def get_os_historico(id_os):
                 'properties': {
                     'status': {
                         'type': 'string',
-                        'enum': ['Em diagnóstico', 'Aguardando aprovação', 'Aprovado', 'Recusada',
-                                 'Solicitado alterações', 'Aguardando peças',
-                                 'Em execução', 'Finalizada', 'Entregue'],
-                        'example': 'Em diagnóstico'
+                        'enum': ['Entregue'],
+                        'example': 'Entregue'
                     }
                 }
             }
@@ -752,7 +752,7 @@ def get_os_historico(id_os):
     ],
     'responses': {
         200: {'description': 'Status atualizado'},
-        400: {'description': 'Transição inválida ou OS não encontrada'}
+        400: {'description': 'OS ainda não finalizada, status controlado pela Saga ou OS não encontrada'}
     }
 })
 def atualizar_status(id_os):
@@ -761,158 +761,6 @@ def atualizar_status(id_os):
     if isinstance(resultado, dict) and "erro" in resultado:
         return jsonify(resultado), 400
     if resultado is False:
-        return jsonify({"erro": "OS não encontrada ou transição inválida"}), 400
-    return jsonify({"mensagem": "Status atualizado"}), 200
-
-
-@api.route('/os/<int:id_os>/aprovacao', methods=['POST'])
-@papel_requerido(ADMIN, CLIENTE)
-@swag_from({
-    'tags': ['Ordem de Serviço'],
-    'description': (
-        'Aprova ou recusa o orçamento de uma OS que esteja em "Aguardando aprovação". '
-        'Com token de cliente, só é permitido para as ordens do próprio cliente.'
-    ),
-    'parameters': [
-        {'name': 'id_os', 'in': 'path', 'type': 'integer', 'required': True, 'example': 1},
-        {
-            'name': 'body', 'in': 'body', 'required': True,
-            'schema': {
-                'type': 'object',
-                'required': ['aprovado'],
-                'properties': {
-                    'aprovado': {'type': 'boolean', 'example': True}
-                }
-            }
-        }
-    ],
-    'responses': {
-        200: {'description': 'Orçamento aprovado (status Aprovado) ou recusado (status Recusada)'},
-        400: {'description': 'OS não está aguardando aprovação ou campo ausente'},
-        403: {'description': 'OS não pertence ao cliente autenticado'}
-    }
-})
-def aprovar_orcamento(id_os):
-    data = request.json or {}
-    if 'aprovado' not in data:
-        return jsonify({"erro": "'aprovado' é obrigatório"}), 400
-    id_cliente = id_cliente_autenticado()
-    if id_cliente and not OficinaAppService.pertence_ao_cliente(id_os, id_cliente):
-        return jsonify({"erro": "Acesso negado a esta ordem de serviço"}), 403
-    resultado = OficinaAppService.aprovar_orcamento(id_os, data['aprovado'])
-    if isinstance(resultado, dict) and "erro" in resultado:
-        return jsonify(resultado), 400
-    acao = "aprovado" if data['aprovado'] else "recusado"
-    return jsonify({"mensagem": f"Orçamento {acao}"}), 200
-
-
-@api.route('/os/<int:id_os>/servicos', methods=['POST'])
-@papel_requerido(ADMIN)
-@swag_from({
-    'tags': ['Ordem de Serviço'],
-    'description': 'Adiciona um serviço a uma OS existente',
-    'parameters': [
-        {'name': 'id_os', 'in': 'path', 'type': 'integer', 'required': True, 'example': 1},
-        {
-            'name': 'body', 'in': 'body', 'required': True,
-            'schema': {
-                'type': 'object',
-                'required': ['servico', 'valor_total'],
-                'properties': {
-                    'servico': {'type': 'string', 'example': 'Troca de óleo'},
-                    'valor_total': {'type': 'number', 'example': 150.0}
-                }
-            }
-        }
-    ],
-    'responses': {
-        201: {'description': 'Serviço adicionado'},
-        400: {'description': 'OS inexistente ou valor inválido'}
-    }
-})
-def adicionar_servico(id_os):
-    data = request.json
-    resultado = OficinaAppService.adicionar_servico(id_os, data['servico'], data['valor_total'])
-    if isinstance(resultado, dict) and "erro" in resultado:
-        return jsonify(resultado), 400
-    return jsonify({"mensagem": "Serviço adicionado"}), 201
-
-
-@api.route('/os/<int:id_os>/pecas', methods=['POST'])
-@papel_requerido(ADMIN)
-@swag_from({
-    'tags': ['Ordem de Serviço'],
-    'description': 'Adiciona uma peça a uma OS existente',
-    'parameters': [
-        {'name': 'id_os', 'in': 'path', 'type': 'integer', 'required': True, 'example': 1},
-        {
-            'name': 'body', 'in': 'body', 'required': True,
-            'schema': {
-                'type': 'object',
-                'required': ['peca', 'valor_total'],
-                'properties': {
-                    'peca': {'type': 'string', 'example': 'Filtro de óleo'},
-                    'valor_total': {'type': 'number', 'example': 80.0}
-                }
-            }
-        }
-    ],
-    'responses': {
-        201: {'description': 'Peça adicionada'},
-        400: {'description': 'OS inexistente ou valor inválido'}
-    }
-})
-def adicionar_peca(id_os):
-    data = request.json
-    resultado = OficinaAppService.adicionar_peca(id_os, data['peca'], data['valor_total'])
-    if isinstance(resultado, dict) and "erro" in resultado:
-        return jsonify(resultado), 400
-    return jsonify({"mensagem": "Peça adicionada"}), 201
-
-
-@api.route('/os/webhook/status', methods=['POST'])
-@swag_from({
-    'tags': ['Webhook'],
-    'description': (
-        'Atualiza o status de uma OS via webhook externo. '
-        'Autenticado pelo header X-Webhook-Token ou campo "token" no body.'
-    ),
-    'security': [],
-    'parameters': [{
-        'name': 'body', 'in': 'body', 'required': True,
-        'schema': {
-            'type': 'object',
-            'required': ['id_os', 'status'],
-            'properties': {
-                'id_os': {'type': 'integer', 'example': 1},
-                'status': {'type': 'string', 'example': 'Em diagnóstico'},
-                'token': {'type': 'string', 'example': 'seu-token-seguro'}
-            }
-        }
-    }],
-    'responses': {
-        200: {'description': 'Status atualizado'},
-        400: {'description': 'Campos ausentes ou transição inválida'},
-        401: {'description': 'Token inválido'}
-    }
-})
-def webhook_status():
-    data = request.json or {}
-    token = request.headers.get('X-Webhook-Token') or data.get('token') or ''
-    if not hmac.compare_digest(token.encode(), os.getenv('WEBHOOK_TOKEN', 'webhook-secret').encode()):
-        OficinaAppService.registrar_erro_integracao('webhook', 'token_invalido')
-        return jsonify({"erro": "Token inválido"}), 401
-    id_os = data.get('id_os')
-    novo_status = data.get('status')
-    if not id_os or not novo_status:
-        OficinaAppService.registrar_erro_integracao('webhook', 'campos_ausentes')
-        return jsonify({"erro": "id_os e status são obrigatórios"}), 400
-    resultado = OficinaAppService.atualizar_progresso_os(id_os, novo_status)
-    if isinstance(resultado, dict) and "erro" in resultado:
-        OficinaAppService.registrar_erro_integracao('webhook', 'transicao_invalida')
-        return jsonify(resultado), 400
-    if resultado is False:
-        OficinaAppService.registrar_erro_integracao('webhook', 'os_nao_encontrada')
         return jsonify({"erro": "OS não encontrada ou transição inválida"}), 400
     return jsonify({"mensagem": "Status atualizado"}), 200
 
