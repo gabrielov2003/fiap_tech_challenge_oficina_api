@@ -7,3 +7,6 @@ __pycache__/
 .env
 .idea/
 *.egg-info/
+terraform/
+.coverage
+htmlcov/

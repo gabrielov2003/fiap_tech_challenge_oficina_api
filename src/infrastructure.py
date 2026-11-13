@@ -1,7 +1,9 @@
+import json
 import os
 import unicodedata
 from contextlib import contextmanager
 
+import boto3
 import psycopg2
 from datadog.dogstatsd import DogStatsd
 from psycopg2 import sql
@@ -11,7 +13,8 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from domain import DomainError
 from ports import (ClienteRepositoryPort, VeiculoRepositoryPort, PecaRepositoryPort, ServicoRepositoryPort,
-                   OrdemServicoRepositoryPort, UsuarioRepositoryPort, SaudeRepositoryPort, MetricasPort)
+                   OrdemServicoRepositoryPort, UsuarioRepositoryPort, SaudeRepositoryPort, MetricasPort,
+                   MensageriaPort)
 
 DB_SCHEMA = os.getenv('DB_SCHEMA', 'public')
 TRAVA_MIGRACAO = 20250301
@@ -95,12 +98,21 @@ CREATE TABLE IF NOT EXISTS usuario (
     senha_hash VARCHAR(255) NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS outbox (
+    id_mensagem SERIAL PRIMARY KEY,
+    fila VARCHAR(120) NOT NULL,
+    corpo JSONB NOT NULL,
+    criado_em TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    enviado_em TIMESTAMPTZ
+);
+
 CREATE INDEX IF NOT EXISTS idx_ordem_servico_status ON ordem_servico (status);
 CREATE INDEX IF NOT EXISTS idx_ordem_servico_cliente ON ordem_servico (id_cliente);
 CREATE INDEX IF NOT EXISTS idx_ordem_servico_veiculo ON ordem_servico (id_veiculo);
 CREATE INDEX IF NOT EXISTS idx_pecas_carro_os ON pecas_carro (id_os);
 CREATE INDEX IF NOT EXISTS idx_servicos_carro_os ON servicos_carro (id_os);
 CREATE INDEX IF NOT EXISTS idx_historico_status_os ON historico_status_os (id_os, data_inicio);
+CREATE INDEX IF NOT EXISTS idx_outbox_pendente ON outbox (id_mensagem) WHERE enviado_em IS NULL;
 """
 
 
@@ -290,15 +302,15 @@ class OrdemServicoRepositoryPostgres(OrdemServicoRepositoryPort):
         return Infrastructure.fetch_all(
             """
             SELECT * FROM ordem_servico
-            WHERE status NOT IN ('Finalizada', 'Entregue', 'Recusada')
+            WHERE status NOT IN ('Finalizada', 'Entregue', 'Recusada', 'Cancelada')
               AND (%(id_cliente)s::integer IS NULL OR id_cliente = %(id_cliente)s)
             ORDER BY CASE status
                 WHEN 'Em execução' THEN 1
                 WHEN 'Aguardando peças' THEN 2
-                WHEN 'Aprovado' THEN 3
-                WHEN 'Aguardando aprovação' THEN 4
-                WHEN 'Solicitado alterações' THEN 5
-                WHEN 'Em diagnóstico' THEN 6
+                WHEN 'Em diagnóstico' THEN 3
+                WHEN 'Aprovado' THEN 4
+                WHEN 'Aguardando pagamento' THEN 5
+                WHEN 'Aguardando aprovação' THEN 6
                 WHEN 'Recebida' THEN 7
                 ELSE 8
             END, data_abertura
@@ -309,7 +321,7 @@ class OrdemServicoRepositoryPostgres(OrdemServicoRepositoryPort):
     def buscar_por_id(self, id_os):
         return Infrastructure.fetch_one('SELECT * FROM ordem_servico WHERE id_os = %s', (id_os,))
 
-    def criar(self, id_cliente, id_veiculo, status, pecas, servicos):
+    def criar(self, id_cliente, id_veiculo, status, pecas, servicos, mensagens=()):
         with Infrastructure.conexao() as conn, conn.cursor() as cursor:
             cursor.execute(
                 'INSERT INTO ordem_servico (id_cliente, id_veiculo, status) VALUES (%s, %s, %s) RETURNING id_os',
@@ -325,9 +337,10 @@ class OrdemServicoRepositoryPostgres(OrdemServicoRepositoryPort):
                 'INSERT INTO servicos_carro (id_os, servico, valor_total) VALUES (%s, %s, %s)',
                 [(id_os, servico, valor) for servico, valor in servicos]
             )
+            _gravar_outbox(cursor, [(fila, {**corpo, 'id_os': id_os}) for fila, corpo in mensagens])
             return id_os
 
-    def atualizar_status(self, id_os, status_atual, novo_status, fechar=False):
+    def atualizar_status(self, id_os, status_atual, novo_status, fechar=False, mensagens=()):
         with Infrastructure.conexao() as conn, conn.cursor() as cursor:
             cursor.execute(
                 """
@@ -347,19 +360,8 @@ class OrdemServicoRepositoryPostgres(OrdemServicoRepositoryPort):
             )
             segundos = cursor.fetchone()[0]
             cursor.execute('INSERT INTO historico_status_os (id_os, status) VALUES (%s, %s)', (id_os, novo_status))
+            _gravar_outbox(cursor, mensagens)
             return segundos or 0.0
-
-    def adicionar_peca(self, id_os, peca, valor_total):
-        return Infrastructure.execute_query(
-            'INSERT INTO pecas_carro (id_os, peca, valor_total) VALUES (%s, %s, %s) RETURNING id_peca_carro',
-            (id_os, peca, valor_total)
-        )
-
-    def adicionar_servico(self, id_os, servico, valor_total):
-        return Infrastructure.execute_query(
-            'INSERT INTO servicos_carro (id_os, servico, valor_total) VALUES (%s, %s, %s) RETURNING id_servico_carro',
-            (id_os, servico, valor_total)
-        )
 
     def buscar_pecas(self, id_os):
         return Infrastructure.fetch_all(
@@ -401,6 +403,28 @@ class OrdemServicoRepositoryPostgres(OrdemServicoRepositoryPort):
             """
         )
 
+    def publicar_outbox(self, enviar, limite=10):
+        with Infrastructure.conexao() as conn, conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(
+                'SELECT id_mensagem, fila, corpo FROM outbox WHERE enviado_em IS NULL '
+                'ORDER BY id_mensagem LIMIT %s FOR UPDATE SKIP LOCKED',
+                (limite,)
+            )
+            pendentes = cursor.fetchall()
+            for mensagem in pendentes:
+                enviar(mensagem['fila'], mensagem['corpo'])
+                cursor.execute(
+                    'UPDATE outbox SET enviado_em = CURRENT_TIMESTAMP WHERE id_mensagem = %s', (mensagem['id_mensagem'],)
+                )
+            return len(pendentes)
+
+
+def _gravar_outbox(cursor, mensagens):
+    cursor.executemany(
+        'INSERT INTO outbox (fila, corpo) VALUES (%s, %s)',
+        [(fila, json.dumps(corpo, default=str)) for fila, corpo in mensagens]
+    )
+
 
 class UsuarioRepositoryPostgres(UsuarioRepositoryPort):
     def buscar_por_username(self, username):
@@ -412,6 +436,48 @@ class UsuarioRepositoryPostgres(UsuarioRepositoryPort):
 class SaudeRepositoryPostgres(SaudeRepositoryPort):
     def ping(self):
         return Infrastructure.fetch_one('SELECT 1 AS ok')['ok'] == 1
+
+
+class MensageriaSQS(MensageriaPort):
+    def __init__(self):
+        self.cliente = None
+        self.urls = {}
+        self.espera = int(os.getenv('SQS_ESPERA_SEGUNDOS', '10'))
+
+    @property
+    def sqs(self):
+        if self.cliente is None:
+            self.cliente = boto3.client('sqs')
+        return self.cliente
+
+    def _url(self, fila):
+        if fila not in self.urls:
+            self.urls[fila] = self.sqs.get_queue_url(QueueName=fila)['QueueUrl']
+        return self.urls[fila]
+
+    def enviar(self, fila, mensagem):
+        self.sqs.send_message(
+            QueueUrl=self._url(fila),
+            MessageBody=json.dumps(mensagem, default=str),
+            MessageGroupId=str(mensagem['id_os']),
+        )
+
+    def receber(self, fila):
+        resposta = self.sqs.receive_message(
+            QueueUrl=self._url(fila), MaxNumberOfMessages=10, WaitTimeSeconds=self.espera
+        )
+        return [(self._ler(m['Body']), m['ReceiptHandle']) for m in resposta.get('Messages', [])]
+
+    def confirmar(self, fila, recibo):
+        self.sqs.delete_message(QueueUrl=self._url(fila), ReceiptHandle=recibo)
+
+    @staticmethod
+    def _ler(corpo):
+        try:
+            mensagem = json.loads(corpo)
+        except json.JSONDecodeError:
+            return {}
+        return mensagem if isinstance(mensagem, dict) else {}
 
 
 def _tag(valor):
@@ -440,3 +506,6 @@ class MetricasDatadog(MetricasPort):
 
     def erro_integracao(self, integracao, motivo):
         self.statsd.increment('oficina.integracao.erros', tags=[f'integracao:{integracao}', f'motivo:{motivo}'])
+
+    def evento_saga(self, tipo, resultado):
+        self.statsd.increment('oficina.saga.eventos', tags=[f'tipo:{_tag(tipo)}', f'resultado:{resultado}'])

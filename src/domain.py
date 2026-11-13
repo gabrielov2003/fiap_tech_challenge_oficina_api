@@ -2,17 +2,20 @@ import re
 from werkzeug.security import generate_password_hash, check_password_hash
 
 TRANSICOES = {
-    "Recebida": ["Em diagnóstico"],
-    "Em diagnóstico": ["Aguardando aprovação"],
-    "Aguardando aprovação": ["Aprovado", "Recusada", "Solicitado alterações"],
-    "Solicitado alterações": ["Em diagnóstico"],
-    "Aprovado": ["Em execução", "Aguardando peças"],
-    "Aguardando peças": ["Em execução", "Recusada"], # Pode ser recusada em caso de atraso no tempo de espera das peças
-    "Em execução": ["Finalizada"],
+    "Recebida": ["Aguardando aprovação", "Cancelada"],
+    "Aguardando aprovação": ["Aguardando pagamento", "Recusada"],
+    "Aguardando pagamento": ["Aprovado", "Cancelada"],
+    "Aprovado": ["Em diagnóstico", "Cancelada"],
+    "Em diagnóstico": ["Em execução", "Aguardando peças", "Cancelada"],
+    "Aguardando peças": ["Em execução", "Cancelada"],
+    "Em execução": ["Finalizada", "Cancelada"],
     "Finalizada": ["Entregue"],
     "Recusada": [],
+    "Cancelada": [],
     "Entregue": [],
 }
+
+STATUS_MANUAIS = ("Entregue",)
 
 STATUS_CLIENTE = ("ativo", "inativo")
 
@@ -41,7 +44,8 @@ class Validador:
             for i in range(2):
                 s = sum(int(doc[j]) * pesos[j] for j in range(12 + i))
                 d = 11 - (s % 11)
-                if d >= 10: d = 0
+                if d >= 10:
+                    d = 0
                 if d != int(doc[12 + i]):
                     raise DomainError("CPF/CNPJ inválido")
                 pesos = [6] + pesos
