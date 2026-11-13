@@ -1,9 +1,10 @@
 import logging
 from functools import wraps
 
-from domain import Cliente, Veiculo, OrdemServico, DomainError, PecasCarro, ServicosCarro, Usuario
+from domain import Cliente, Veiculo, OrdemServico, DomainError, PecasCarro, ServicosCarro, Usuario, STATUS_MANUAIS
 from ports import (ClienteRepositoryPort, VeiculoRepositoryPort, PecaRepositoryPort, ServicoRepositoryPort,
-                   OrdemServicoRepositoryPort, UsuarioRepositoryPort, SaudeRepositoryPort, MetricasPort)
+                   OrdemServicoRepositoryPort, UsuarioRepositoryPort, SaudeRepositoryPort, MetricasPort,
+                   MensageriaPort)
 
 logger = logging.getLogger('oficina.aplicacao')
 
@@ -15,6 +16,22 @@ os_repo: OrdemServicoRepositoryPort = None
 usuario_repo: UsuarioRepositoryPort = None
 saude_repo: SaudeRepositoryPort = None
 metricas: MetricasPort = None
+mensageria: MensageriaPort = None
+filas = {'eventos': None, 'billing': None, 'execucao': None}
+
+EVENTOS_SAGA = {
+    'OrcamentoGerado': "Aguardando aprovação",
+    'OrcamentoFalhou': "Cancelada",
+    'OrcamentoAprovado': "Aguardando pagamento",
+    'OrcamentoRecusado': "Recusada",
+    'PagamentoAprovado': "Aprovado",
+    'PagamentoRecusado': "Cancelada",
+    'ExecucaoFalhou': "Cancelada",
+}
+
+
+class MensagemInvalida(Exception):
+    pass
 
 
 def monitorar_os(operacao):
@@ -172,15 +189,23 @@ class OficinaAppService:
 
     @staticmethod
     @monitorar_os('abertura')
-    def abrir_ordem_servico(id_cliente, id_veiculo, pecas=None, servicos=None):
+    def abrir_ordem_servico(id_cliente, id_veiculo, pecas=None, servicos=None, correlation_id=None):
         try:
             os_dominio = OrdemServico(id_cliente=id_cliente, id_veiculo=id_veiculo)
             itens_pecas = [PecasCarro(None, p['peca'], p['valor_total']) for p in (pecas or [])]
             itens_servicos = [ServicosCarro(None, s['servico'], s['valor_total']) for s in (servicos or [])]
+            if not itens_pecas and not itens_servicos:
+                raise DomainError("Informe pelo menos uma peça ou um serviço para gerar o orçamento")
+            gerar_orcamento = {
+                'tipo': 'GerarOrcamento',
+                'dados': {'id_cliente': id_cliente, 'itens': itens_da_os(itens_pecas, itens_servicos)},
+                'correlation_id': correlation_id,
+            }
             id_os = os_repo.criar(
                 os_dominio.id_cliente, os_dominio.id_veiculo, os_dominio.status,
                 [(p.peca, p.valor_total) for p in itens_pecas],
-                [(s.servico, s.valor_total) for s in itens_servicos]
+                [(s.servico, s.valor_total) for s in itens_servicos],
+                mensagens=[(filas['billing'], gerar_orcamento)]
             )
         except DomainError as e:
             return {"erro": str(e)}
@@ -189,45 +214,12 @@ class OficinaAppService:
         return id_os
 
     @staticmethod
-    @monitorar_os('inclusao_peca')
-    def adicionar_peca(id_os, nome_peca, valor):
-        try:
-            peca = PecasCarro(id_os=id_os, peca=nome_peca, valor_total=valor)
-            return os_repo.adicionar_peca(peca.id_os, peca.peca, peca.valor_total)
-        except DomainError as e:
-            return {"erro": str(e)}
-
-    @staticmethod
-    @monitorar_os('inclusao_servico')
-    def adicionar_servico(id_os, nome_servico, valor):
-        try:
-            s = ServicosCarro(id_os=id_os, servico=nome_servico, valor_total=valor)
-            return os_repo.adicionar_servico(s.id_os, s.servico, s.valor_total)
-        except DomainError as e:
-            return {"erro": str(e)}
-
-    @staticmethod
     def listar_ordens(id_cliente=None):
         return os_repo.listar_ativas(id_cliente)
 
     @staticmethod
-    def pertence_ao_cliente(id_os, id_cliente):
-        row = os_repo.buscar_por_id(id_os)
-        return bool(row) and row['id_cliente'] == id_cliente
-
-    @staticmethod
     def historico_os(id_os):
         return os_repo.historico(id_os)
-
-    @staticmethod
-    @monitorar_os('aprovacao')
-    def aprovar_orcamento(id_os, aprovado):
-        row = os_repo.buscar_por_id(id_os)
-        if not row:
-            return {"erro": "OS não encontrada"}
-        if row['status'] != "Aguardando aprovação":
-            return {"erro": f"OS não está aguardando aprovação (status atual: '{row['status']}')"}
-        return OficinaAppService._transicionar(row, "Aprovado" if aprovado else "Recusada")
 
     @staticmethod
     def tempo_medio_execucao():
@@ -242,17 +234,21 @@ class OficinaAppService:
         row = os_repo.buscar_por_id(id_os)
         if not row:
             return False
+        if novo_status not in STATUS_MANUAIS:
+            return {"erro": f"O status '{novo_status}' é controlado pela saga, manualmente só é possível marcar 'Entregue'"}
         return OficinaAppService._transicionar(row, novo_status)
 
     @staticmethod
-    def _transicionar(row, novo_status):
+    def _transicionar(row, novo_status, mensagens=()):
         os_obj = OrdemServico(row['id_cliente'], row['id_veiculo'], id_os=row['id_os'], status=row['status'])
         if not os_obj.pode_transicionar_para(novo_status):
             logger.warning('transicao_rejeitada', extra={
                 'id_os': os_obj.id_os, 'status_atual': os_obj.status, 'status_solicitado': novo_status
             })
             return {"erro": f"Transição inválida de '{os_obj.status}' para '{novo_status}'"}
-        segundos = os_repo.atualizar_status(os_obj.id_os, os_obj.status, novo_status, fechar=novo_status == "Entregue")
+        segundos = os_repo.atualizar_status(
+            os_obj.id_os, os_obj.status, novo_status, fechar=novo_status == "Entregue", mensagens=mensagens
+        )
         if segundos is None:
             return {"erro": "A OS foi alterada por outra operação, tente novamente"}
         metricas.status_alterado(os_obj.status, novo_status, segundos)
@@ -292,7 +288,80 @@ class OficinaAppService:
             logger.exception('banco_indisponivel')
             return False
 
+
+
+def itens_da_os(pecas, servicos):
+    return (
+        [{'descricao': p.peca, 'tipo': 'peca', 'valor': p.valor_total} for p in pecas]
+        + [{'descricao': s.servico, 'tipo': 'servico', 'valor': s.valor_total} for s in servicos]
+    )
+
+
+class SagaOrdemServico:
     @staticmethod
-    def registrar_erro_integracao(integracao, motivo):
-        logger.warning('erro_integracao', extra={'integracao': integracao, 'motivo': motivo})
-        metricas.erro_integracao(integracao, motivo)
+    def tratar_evento(mensagem):
+        tipo, dados = mensagem.get('tipo'), mensagem.get('dados') or {}
+        row = os_repo.buscar_por_id(mensagem['id_os']) if mensagem.get('id_os') else None
+        contexto = {'tipo': tipo, 'id_os': mensagem.get('id_os'), 'correlation_id': mensagem.get('correlation_id')}
+        if row and tipo == 'PagamentoEstornado':
+            logger.info('compensacao_concluida', extra=contexto)
+            metricas.evento_saga(tipo, 'processado')
+            return
+        novo_status = dados.get('status') if tipo == 'ExecucaoAtualizada' else EVENTOS_SAGA.get(tipo)
+        if not row or not novo_status:
+            raise MensagemInvalida(f"Evento inválido: {tipo}")
+        os_obj = OrdemServico(row['id_cliente'], row['id_veiculo'], id_os=row['id_os'], status=row['status'])
+        if not os_obj.pode_transicionar_para(novo_status):
+            logger.info('evento_ignorado', extra={**contexto, 'status_atual': row['status'], 'status_evento': novo_status})
+            metricas.evento_saga(tipo, 'ignorado')
+            return
+        comandos = SagaOrdemServico._comandos(tipo, row, dados, mensagem.get('correlation_id'))
+        if OficinaAppService._transicionar(row, novo_status, comandos) is not True:
+            raise RuntimeError(f"OS {row['id_os']} alterada por outra operação, o evento será reprocessado")
+        metricas.evento_saga(tipo, 'processado')
+        logger.info('evento_processado', extra={**contexto, 'novo_status': novo_status})
+
+    @staticmethod
+    def _comandos(tipo, row, dados, correlation_id):
+        if tipo == 'PagamentoAprovado':
+            pecas = [PecasCarro(row['id_os'], p['peca'], p['valor_total']) for p in os_repo.buscar_pecas(row['id_os'])]
+            servicos = [
+                ServicosCarro(row['id_os'], s['servico'], s['valor_total']) for s in os_repo.buscar_servicos(row['id_os'])
+            ]
+            return [(filas['execucao'], {
+                'tipo': 'IniciarExecucao', 'id_os': row['id_os'],
+                'dados': {'itens': itens_da_os(pecas, servicos)}, 'correlation_id': correlation_id,
+            })]
+        if tipo == 'ExecucaoFalhou':
+            logger.warning('compensacao_iniciada', extra={'id_os': row['id_os'], 'motivo': dados.get('motivo')})
+            return [(filas['billing'], {
+                'tipo': 'EstornarPagamento', 'id_os': row['id_os'],
+                'dados': {'motivo': dados.get('motivo')}, 'correlation_id': correlation_id,
+            })]
+        return []
+
+    @staticmethod
+    def publicar_pendentes():
+        return os_repo.publicar_outbox(mensageria.enviar)
+
+
+def processar_eventos():
+    try:
+        SagaOrdemServico.publicar_pendentes()
+    except Exception:
+        logger.exception('falha_publicacao_outbox')
+        metricas.erro_integracao('sqs', 'falha_publicacao')
+    for mensagem, recibo in mensageria.receber(filas['eventos']):
+        contexto = {
+            'tipo': mensagem.get('tipo'), 'id_os': mensagem.get('id_os'), 'correlation_id': mensagem.get('correlation_id')
+        }
+        try:
+            SagaOrdemServico.tratar_evento(mensagem)
+        except MensagemInvalida:
+            logger.warning('mensagem_invalida', extra=contexto)
+            metricas.erro_integracao('sqs', 'mensagem_invalida')
+        except Exception:
+            logger.exception('falha_processamento_mensagem', extra=contexto)
+            metricas.erro_integracao('sqs', 'falha_processamento')
+            continue
+        mensageria.confirmar(filas['eventos'], recibo)

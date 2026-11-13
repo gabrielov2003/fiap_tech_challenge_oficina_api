@@ -1,29 +1,34 @@
-# fiap_tech_challenge_oficina_api
+# fiap_tech_challenge_oficina_api (OS Service)
 
-
-API da oficina mecânica: clientes, veículos, catálogo de peças e serviços e ordens de serviço. Roda no EKS, atrás do API Gateway, e grava no RDS PostgreSQL. Faz parte do Tech Challenge Fase 3:
+Microsserviço de ordens de serviço da oficina: cadastros (clientes, veículos, catálogo de peças e serviços), abertura da OS, status, histórico e orquestração da Saga. Roda no EKS, atrás do API Gateway, e grava no RDS PostgreSQL. Faz parte do Tech Challenge Fase 4:
 
 | Repositório | Responsabilidade |
 |---|---|
-| fiap_tech_challenge_oficina_api | Este repositório. Aplicação principal, no EKS |
+| fiap_tech_challenge_oficina_api | Este repositório. OS Service, orquestrador da Saga |
+| [fiap_tech_challenge_oficina_billing_service](https://github.com/gabrielov2003/fiap_tech_challenge_oficina_billing_service) | Orçamentos e pagamentos com Mercado Pago |
+| [fiap_tech_challenge_oficina_execution_service](https://github.com/gabrielov2003/fiap_tech_challenge_oficina_execution_service) | Fila de execução, diagnóstico e reparo |
 | [fiap_tech_challenge_oficina_auth_lambda](https://github.com/gabrielov2003/fiap_tech_challenge_oficina_auth_lambda) | Autenticação por CPF e API Gateway |
-| [fiap_tech_challenge_oficina_infra_k8s](https://github.com/gabrielov2003/fiap_tech_challenge_oficina_infra_k8s) | Rede, cluster EKS, segredos e Datadog |
-| [fiap_tech_challenge_oficina_infra_database](https://github.com/gabrielov2003/fiap_tech_challenge_oficina_infra_database) | Banco de dados RDS PostgreSQL |
+| [fiap_tech_challenge_oficina_infra_k8s](https://github.com/gabrielov2003/fiap_tech_challenge_oficina_infra_k8s) | Rede, cluster EKS, registro de imagens, segredos e Datadog |
+| [fiap_tech_challenge_oficina_infra_database](https://github.com/gabrielov2003/fiap_tech_challenge_oficina_infra_database) | Banco RDS PostgreSQL do OS Service |
 
 ## Arquitetura
 
 ```mermaid
 flowchart LR
-    U["Cliente ou atendente"] -->|"HTTPS com JWT"| GW["API Gateway"]
-    GW -->|"HTTP proxy com X-Correlation-ID"| LB["Load Balancer"]
+    U["Cliente ou funcionário"] -->|"HTTPS com JWT"| GW["API Gateway"]
+    GW -->|"/api"| LB["Load Balancer"]
     subgraph EKS["EKS, namespace dev ou prod"]
-        API["Pods oficina-api, HPA de 1 a 5"]
-        DD["Datadog Agent"]
+        API["oficina-api, HPA de 1 a 5"]
+        W["oficina-worker, orquestrador da Saga"]
     end
     LB --> API
-    API -->|"SQL no schema do ambiente"| RDS[("RDS PostgreSQL")]
-    API -.->|"métricas, traces e logs"| DD
-    SSM["SSM Parameter Store"] -.->|"segredos no deploy"| API
+    API -->|"OS, itens, histórico e outbox"| RDS[("RDS PostgreSQL")]
+    W -->|"lê o outbox e grava a saga"| RDS
+    W -->|"comandos"| QB["SQS billing-comandos"]
+    W -->|"comandos"| QE["SQS execucao-comandos"]
+    QO["SQS os-eventos"] -->|"eventos"| W
+    API -.->|"métricas, traces e logs"| DD["Datadog"]
+    W -.-> DD
 ```
 
 O código segue DDD com arquitetura hexagonal:
@@ -31,118 +36,133 @@ O código segue DDD com arquitetura hexagonal:
 | Arquivo | Papel |
 |---|---|
 | `src/domain.py` | Entidades, validação de CPF, CNPJ e placa, e transições da OS |
-| `src/ports.py` | Interfaces de repositórios, saúde do banco e métricas |
-| `src/application.py` | Casos de uso |
-| `src/infrastructure.py` | Repositórios PostgreSQL e métricas do Datadog |
+| `src/ports.py` | Interfaces de repositórios, mensageria, saúde do banco e métricas |
+| `src/application.py` | Casos de uso e a Saga (`SagaOrdemServico`) |
+| `src/infrastructure.py` | Repositórios PostgreSQL, outbox, SQS e métricas do Datadog |
 | `src/web.py` | Rotas, controle de acesso por perfil e Swagger |
+| `src/worker.py` | Processo que publica o outbox e consome os eventos da Saga |
 | `src/observabilidade.py` | Logs JSON e correlation id |
 | `src/app.py` | Monta a aplicação e injeta os adapters |
+
+## Saga: orquestrada
+
+A Saga da OS é orquestrada por este serviço. Escolhemos orquestração em vez de coreografia porque o OS Service já é dono da máquina de estados da OS: ele decide o próximo passo, guarda o estado da saga no próprio status da OS e no histórico, e concentra as compensações num lugar só. Isso deixa o fluxo fácil de seguir nos logs e no Datadog e fácil de testar. Na coreografia, cada serviço reagiria aos eventos dos outros e o fluxo ficaria espalhado em três repositórios.
+
+```mermaid
+sequenceDiagram
+    participant C as Cliente
+    participant OS as OS Service
+    participant B as Billing
+    participant MP as Mercado Pago
+    participant E as Execution
+    C->>OS: POST /api/os com peças e serviços
+    OS->>B: GerarOrcamento
+    B-->>OS: OrcamentoGerado (Aguardando aprovação)
+    C->>B: POST /billing/orcamentos/{id}/aprovacao
+    B-->>OS: OrcamentoAprovado (Aguardando pagamento)
+    C->>MP: paga pelo link
+    MP->>B: webhook de pagamento
+    B-->>OS: PagamentoAprovado (Aprovado)
+    OS->>E: IniciarExecucao
+    E-->>OS: ExecucaoAtualizada (Em diagnóstico, Em execução, Finalizada)
+    Note over OS,E: Em caso de falha
+    E-->>OS: ExecucaoFalhou
+    OS->>B: EstornarPagamento (compensação)
+    B-->>OS: PagamentoEstornado
+```
+
+| Etapa | Sucesso | Falha e compensação |
+|---|---|---|
+| Abertura | OS Recebida e comando `GerarOrcamento` | Dados inválidos: a saga nem começa |
+| Orçamento | `OrcamentoGerado`, OS Aguardando aprovação | `OrcamentoFalhou`: OS Cancelada |
+| Aprovação | `OrcamentoAprovado`, OS Aguardando pagamento | `OrcamentoRecusado`: OS Recusada |
+| Pagamento | `PagamentoAprovado`, OS Aprovado e comando `IniciarExecucao` | `PagamentoRecusado`: OS Cancelada, o Billing cancela a cobrança |
+| Execução | `ExecucaoAtualizada` até Finalizada | `ExecucaoFalhou`: OS Cancelada e comando `EstornarPagamento` para o Billing |
+| Entrega | Funcionário marca Entregue | |
+
+Como a consistência é garantida:
+
+* Outbox: o comando é gravado na tabela `outbox` na mesma transação da OS. O worker publica depois no SQS, então nunca acontece de gravar a OS e perder o comando.
+* Filas FIFO com `MessageGroupId` igual ao id da OS: os eventos de uma OS chegam em ordem.
+* Idempotência: evento repetido ou fora de ordem é ignorado pela máquina de estados, e a mudança de status só grava se o status lido ainda for o atual.
+* Erro inesperado deixa a mensagem na fila para nova tentativa, e depois de 3 tentativas ela vai para a DLQ.
 
 ## Autenticação e perfis
 
 | Perfil | Como obtém o token | O que acessa |
 |---|---|---|
 | `admin` (funcionário) | `POST /api/login` com usuário e senha | Todas as rotas |
-| `cliente` | `POST /auth` no API Gateway, com o CPF | Abrir OS para si, listar as próprias OS e aprovar ou recusar o orçamento delas |
+| `cliente` | `POST /auth` no API Gateway, com o CPF | Abrir OS para si e listar as próprias OS |
+| `servico` | Gerado pela Lambda de autenticação | Só `GET /api/clientes/documento/{cpf}`, para validar o cliente no login |
 
-Rotas públicas: `GET /api/os/{id}`, `GET /api/os/{id}/status`, `POST /api/os/webhook/status` (com o token do webhook), `GET /api/health` e `GET /api/ready`.
+Rotas públicas: `GET /api/os/{id}`, `GET /api/os/{id}/status`, `GET /api/health` e `GET /api/ready`. O status da OS é controlado pela Saga, e manualmente o funcionário só marca `Entregue`.
 
-Na nuvem, a senha do `admin` vem do secret `ADMIN_PASSWORD` do GitHub. Sem ele, o pipeline usa a senha gerada pelo Terraform em `/oficina/<env>/admin_password`, no SSM. Para trocar, altere o secret e rode o deploy de novo: a API atualiza a senha ao subir.
+A senha do `admin` vem do secret `ADMIN_PASSWORD` do GitHub. Sem ele, o pipeline usa a senha gerada pelo Terraform em `/oficina/<env>/admin_password`, no SSM.
 
 ## Swagger
 
-* Nuvem: `<URL do gateway>/apidocs/`, com a barra no final. A URL do gateway está em `/oficina/<env>/gateway_url` no SSM.
+* Nuvem: `<URL do gateway>/apidocs/`, com a barra no final.
 * Local: `http://localhost:5000/apidocs/`.
-
-Gere o token (`POST /api/login` para funcionários ou `POST /auth` no gateway para clientes), clique em Authorize e informe `Bearer <token>`.
-
-## Fluxo da ordem de serviço
-
-Recebida, Em diagnóstico, Aguardando aprovação e então Aprovado, Recusada ou Solicitado alterações, que volta para Em diagnóstico. Aprovado segue para Em execução ou Aguardando peças, e depois Finalizada e Entregue. Transições fora dessa ordem são rejeitadas. A troca de status só grava se o status lido ainda for o atual, e cada mudança entra em `historico_status_os`, base do tempo médio por status em `GET /api/os/tempo-medio`.
 
 ## Banco de dados
 
-As tabelas são criadas pela API na inicialização, dentro de um advisory lock, então várias réplicas sobem juntas sem conflito. Cada ambiente usa o próprio schema (`dev` ou `prod`) no mesmo RDS. A justificativa do banco, o diagrama ER e os relacionamentos estão no [README do infra_database](https://github.com/gabrielov2003/fiap_tech_challenge_oficina_infra_database).
+PostgreSQL no RDS, schema por ambiente (`dev` ou `prod`). As tabelas, incluindo a `outbox`, são criadas pela API na inicialização, dentro de um advisory lock. A justificativa do banco e o diagrama ER estão no [README do infra_database](https://github.com/gabrielov2003/fiap_tech_challenge_oficina_infra_database). Nenhum outro serviço acessa esse banco.
 
 ## Observabilidade
 
-* Logs JSON no stdout com `correlation_id`, `dd.trace_id`, rota, status e duração de cada requisição.
-* APM com `ddtrace-run`, que mede a latência por endpoint.
-* Healthcheck em `/api/health` (liveness) e `/api/ready` (readiness, testa o banco), usados pelas probes e pelo `http_check` do Datadog.
-* Métricas de negócio pelo DogStatsD:
-
-| Métrica | O que mede |
-|---|---|
-| `oficina.os.abertas` | OS abertas, base do volume diário |
-| `oficina.os.status_alterado` | Mudanças de status |
-| `oficina.os.tempo_status` | Segundos em cada status, com a tag `status` |
-| `oficina.os.falhas` | Falhas no processamento de OS, com a tag `operacao` |
-| `oficina.integracao.erros` | Erros no webhook, com as tags `integracao` e `motivo` |
-
-O dashboard e os alertas são criados pelo `infra_k8s`.
+* Logs JSON com `correlation_id`, `id_os` e `dd.trace_id`. Filtrar por `@id_os` no Datadog mostra a saga inteira nos três serviços.
+* APM com `ddtrace-run` na API e no worker, incluindo as chamadas ao SQS.
+* Healthcheck em `/api/health` e `/api/ready`.
+* Métricas: `oficina.os.abertas`, `oficina.os.status_alterado`, `oficina.os.tempo_status`, `oficina.os.falhas`, `oficina.saga.eventos` (tags `tipo` e `resultado`) e `oficina.integracao.erros`.
 
 ## Como rodar localmente
-
-Pré-requisitos: Docker e, para os testes, Python 3.11+. O `.env.example` traz todas as variáveis.
 
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
 
-A API sobe em `http://localhost:5000`. Login: `POST /api/login` com `{"username": "admin", "senha": "admin123"}`.
+A API sobe em `http://localhost:5000`. Login: `POST /api/login` com `{"username": "admin", "senha": "admin123"}`. O worker precisa das filas do SQS: com credenciais AWS e as filas do ambiente `dev` criadas, rode `python src/worker.py`.
 
-Para mandar os dados ao Datadog, preencha `DD_API_KEY` e `DD_SITE` no `.env` e suba junto o agente. Os dados chegam com a tag `env:local`:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.datadog.yml up -d --build
-```
-
-## Testes
-
-Rodam contra um PostgreSQL real:
+## Testes e cobertura
 
 ```bash
 docker compose up -d db
 python -m pip install -r requirements.txt -r requirements-dev.txt
-python -m pytest tests/unit_tests.py -v
+python -m pytest --cov --cov-report=term-missing --cov-fail-under=80
 ```
 
-Cobrem os cadastros, o fluxo completo da OS, as permissões por perfil, o token no formato da Lambda, o histórico e o tempo médio, as restrições do banco, o webhook, os healthchecks e o correlation id.
+* Testes unitários em `tests/unit_tests.py`: cadastros, permissões, Saga, outbox, worker e adapter do SQS (com moto).
+* BDD em `tests/features/saga_ordem_servico.feature`: o fluxo completo da OS e as compensações (orçamento recusado, pagamento recusado e falha na execução).
+* Cobertura mínima de 80%, verificada no pipeline. O resultado de cada execução fica no resumo do job `test`, na aba [Actions](https://github.com/gabrielov2003/fiap_tech_challenge_oficina_api/actions). Última medição: 91%.
 
 ## Kubernetes
-
-Os manifestos em `k8s/` são preenchidos pelo pipeline com `envsubst`:
 
 | Arquivo | O que cria |
 |---|---|
 | `namespace.yaml` | Namespace do ambiente |
-| `configmap.yaml` | Conexão com o banco, sem a senha, e schema |
-| `secret.yaml` | Senha do banco, chave JWT, token do webhook e senha do admin, lidos do SSM |
-| `deployment.yaml` | Pods com probes, limites de CPU e memória, tags do Datadog e `http_check` |
+| `serviceaccount.yaml` | Conta do worker, ligada ao role da AWS pelo Pod Identity |
+| `configmap.yaml` | Conexão com o banco, schema e nomes das filas |
+| `secret.yaml` | Senha do banco, chave JWT e senha do admin |
+| `deployment.yaml` | API com probes, limites e tags do Datadog |
+| `worker.yaml` | Worker da Saga |
 | `service.yaml` | LoadBalancer usado pelo API Gateway |
 | `hpa.yaml` | Escala de 1 a 5 pods por CPU (70%) ou memória (80%) |
 
 ## CI/CD
 
-| Branch | Ambiente | Namespace e schema |
-|---|---|---|
-| `dev` | dev | `dev` |
-| `main` | prod | `prod` |
-
 | Job | Quando roda | O que faz |
 |---|---|---|
-| `test` | Pull requests e pushes em `dev` e `main` | Testes com um PostgreSQL de serviço e Bandit |
+| `test` | Pull requests e pushes em `dev` e `main` | Testes unitários e BDD com PostgreSQL de serviço e cobertura mínima de 80% |
+| `quality` | Junto com o `test` | Ruff (erros e complexidade), Bandit (segurança) e `terraform validate` |
 | `build` | Push em `dev` ou `main` | Build da imagem e push no ECR `oficina-api` |
-| `deploy` | Depois do build | Lê o SSM, aplica os manifestos, espera o rollout e publica a URL do LoadBalancer em `/oficina/<env>/api_url`, usada pelo API Gateway |
+| `deploy` | Depois do build | Terraform da fila e do role do worker, manifestos no namespace do ambiente e URL publicada em `/oficina/<env>/api_url` |
 
-Secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` e, opcional, `ADMIN_PASSWORD` (use letras e números). Variável opcional: `AWS_REGION` (padrão `us-east-1`). Sem as credenciais, só os testes rodam.
+`dev` publica no ambiente de homologação e `main` em produção. Secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` e, opcional, `ADMIN_PASSWORD`. Variáveis: `TF_STATE_BUCKET` e, opcional, `AWS_REGION`.
 
-Ordem do primeiro deploy: `infra_k8s`, `infra_database`, esta API e por último a `auth_lambda`.
+Com a infra desligada (chave `/oficina/infra/ligada` no SSM), o `deploy` é pulado com um aviso. O workflow Ligar infra, no `infra_k8s`, sobe a infra e dispara este pipeline em `dev` e `main`.
 
-## Documentação
-
-RFCs, ADRs, diagramas e roteiro do vídeo: [documentacao_fase3](https://github.com/gabrielov2003/TechChallenge1/tree/main/documentacao_fase3).
+Ordem do primeiro deploy: `infra_k8s`, `infra_database`, este serviço, `billing_service`, `execution_service` e por último a `auth_lambda`.
 
 ---
 Este projeto faz parte do Tech Challenge da Pós Graduação em Arquitetura de Software da FIAP.

@@ -9,7 +9,7 @@ from flask_jwt_extended import JWTManager
 import application
 from infrastructure import (Infrastructure, ClienteRepositoryPostgres, VeiculoRepositoryPostgres,
                             PecaRepositoryPostgres, ServicoRepositoryPostgres, OrdemServicoRepositoryPostgres,
-                            UsuarioRepositoryPostgres, SaudeRepositoryPostgres, MetricasDatadog)
+                            UsuarioRepositoryPostgres, SaudeRepositoryPostgres, MetricasDatadog, MensageriaSQS)
 from observabilidade import configurar_logs, registrar_rastreamento
 from web import api
 
@@ -20,6 +20,23 @@ class JSONProvider(DefaultJSONProvider):
         if isinstance(o, (datetime, date)):
             return o.isoformat()
         return DefaultJSONProvider.default(o)
+
+
+def injetar_dependencias():
+    Infrastructure.init_db()
+
+    application.cliente_repo = ClienteRepositoryPostgres()
+    application.veiculo_repo = VeiculoRepositoryPostgres()
+    application.peca_repo = PecaRepositoryPostgres()
+    application.servico_repo = ServicoRepositoryPostgres()
+    application.os_repo = OrdemServicoRepositoryPostgres()
+    application.usuario_repo = UsuarioRepositoryPostgres()
+    application.saude_repo = SaudeRepositoryPostgres()
+    application.metricas = MetricasDatadog()
+    application.mensageria = MensageriaSQS()
+    application.filas['eventos'] = os.getenv('FILA_EVENTOS', 'oficina-local-os-eventos.fifo')
+    application.filas['billing'] = os.getenv('FILA_BILLING', 'oficina-local-billing-comandos.fifo')
+    application.filas['execucao'] = os.getenv('FILA_EXECUCAO', 'oficina-local-execucao-comandos.fifo')
 
 
 def create_app():
@@ -37,8 +54,9 @@ def create_app():
     Swagger(app, template={
         'info': {
             'title': 'API Oficina',
-            'version': '3.0',
+            'version': '4.0',
             'description': (
+                'OS Service: cadastros, abertura e acompanhamento das ordens de serviço e orquestração da Saga. '
                 'Funcionários fazem login em POST /api/login. Clientes se autenticam com o CPF '
                 'em POST /auth, rota do API Gateway atendida pela Lambda. '
                 'Use o token no botão Authorize.'
@@ -55,17 +73,7 @@ def create_app():
         'security': [{'Bearer': []}]
     })
 
-    Infrastructure.init_db()
-
-    application.cliente_repo = ClienteRepositoryPostgres()
-    application.veiculo_repo = VeiculoRepositoryPostgres()
-    application.peca_repo = PecaRepositoryPostgres()
-    application.servico_repo = ServicoRepositoryPostgres()
-    application.os_repo = OrdemServicoRepositoryPostgres()
-    application.usuario_repo = UsuarioRepositoryPostgres()
-    application.saude_repo = SaudeRepositoryPostgres()
-    application.metricas = MetricasDatadog()
-
+    injetar_dependencias()
     registrar_rastreamento(app)
     app.register_blueprint(api, url_prefix='/api')
 

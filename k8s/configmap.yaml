@@ -10,3 +10,7 @@ data:
   DB_NAME: "${DB_NAME}"
   DB_SCHEMA: "${ENV}"
   DD_LOGS_INJECTION: "true"
+  AWS_DEFAULT_REGION: "${AWS_REGION}"
+  FILA_EVENTOS: "oficina-${ENV}-os-eventos.fifo"
+  FILA_BILLING: "oficina-${ENV}-billing-comandos.fifo"
+  FILA_EXECUCAO: "oficina-${ENV}-execucao-comandos.fifo"
