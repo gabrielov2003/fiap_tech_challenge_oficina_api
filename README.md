@@ -160,6 +160,8 @@ python -m pytest --cov --cov-report=term-missing --cov-fail-under=80
 
 `dev` publica no ambiente de homologação e `main` em produção. Secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` e, opcional, `ADMIN_PASSWORD`. Variáveis: `TF_STATE_BUCKET` e, opcional, `AWS_REGION`.
 
+Com a infra desligada (chave `/oficina/infra/ligada` no SSM), o `deploy` é pulado com um aviso. O workflow Ligar infra, no `infra_k8s`, sobe a infra e dispara este pipeline em `dev` e `main`.
+
 Ordem do primeiro deploy: `infra_k8s`, `infra_database`, este serviço, `billing_service`, `execution_service` e por último a `auth_lambda`.
 
 ---
